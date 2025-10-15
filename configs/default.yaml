@@ -1,0 +1,13 @@
+dataset_root: data/
+dataset_name: veremi
+model:
+  hidden_dim: 128
+  dropout: 0.3
+  use_gat: false
+  heads: 4
+  kl_strength: 1.0e-3
+train:
+  epochs: 200
+  lr: 0.001
+  batch_size: 1
+  seed: 42
