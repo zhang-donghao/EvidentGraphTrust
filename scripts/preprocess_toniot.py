@@ -317,40 +317,60 @@ def _load_network(config: TONTConfig) -> pd.DataFrame:
     return df
 
 
-def _row_fallback_windows(df: pd.DataFrame, min_chunk_size: int) -> Iterable[pd.DataFrame]:
+def _row_fallback_windows(
+    df: pd.DataFrame, min_chunk_size: int, target_windows: int
+) -> Iterable[pd.DataFrame]:
     if df.empty:
         yield df
         return
     if min_chunk_size <= 0:
         min_chunk_size = 1
-    chunk_count = max(1, min(10, len(df) // max(1, min_chunk_size)))
-    if chunk_count <= 1 and len(df) >= min_chunk_size * 2:
-        chunk_count = 2
-    if chunk_count <= 2 and len(df) >= min_chunk_size * 3:
+    target_windows = max(3, int(target_windows))
+    # Approximate the desired chunk size so that we generate enough windows to
+    # satisfy downstream split requirements without materialising tens of
+    # thousands of miniature chunks.
+    approx_chunk_size = max(
+        min_chunk_size,
+        int(np.ceil(len(df) / target_windows)) if target_windows else len(df),
+    )
+    chunk_count = int(np.ceil(len(df) / approx_chunk_size))
+    # Guarantee at least three chunks when sufficient rows are available so
+    # train/val/test splits remain feasible.
+    if chunk_count < 3 and len(df) >= min_chunk_size * 3:
         chunk_count = 3
+    if chunk_count < 2 and len(df) >= min_chunk_size * 2:
+        chunk_count = 2
+    chunk_count = max(1, min(chunk_count, len(df)))
     if chunk_count <= 1:
         yield df
         return
-    for chunk in np.array_split(df.sort_index(), chunk_count):
-        if not chunk.empty:
-            yield chunk
+    sorted_df = df.sort_index()
+    indices = np.array_split(sorted_df.index.to_numpy(), chunk_count)
+    for idx in indices:
+        if idx.size == 0:
+            continue
+        yield sorted_df.loc[idx]
 
 
 def _window_iterator(
-    df: pd.DataFrame, window: float, stride: float, min_chunk_size: int
+    df: pd.DataFrame,
+    window: float,
+    stride: float,
+    min_chunk_size: int,
+    target_windows: int,
 ) -> Iterable[pd.DataFrame]:
     if "timestamp" not in df.columns:
-        yield from _row_fallback_windows(df, min_chunk_size)
+        yield from _row_fallback_windows(df, min_chunk_size, target_windows)
         return
     timestamp_series = pd.to_numeric(df["timestamp"], errors="coerce")
     valid = timestamp_series.dropna()
     if valid.empty:
-        yield from _row_fallback_windows(df, min_chunk_size)
+        yield from _row_fallback_windows(df, min_chunk_size, target_windows)
         return
     start = float(valid.min())
     end = float(valid.max())
     if not np.isfinite(start) or not np.isfinite(end) or end - start < window:
-        yield from _row_fallback_windows(df, min_chunk_size)
+        yield from _row_fallback_windows(df, min_chunk_size, target_windows)
         return
     current = start
     while current <= end:
@@ -522,8 +542,17 @@ def _extract_graphs_from_network(
     graphs: List[Data] = []
     feature_cache: List[np.ndarray] = []
     metadata_feature_names: Optional[List[str]] = None
+    target_windows = max(3, config.min_split_graphs * 3)
     for chunk in tqdm(
-        list(_window_iterator(network_df, config.window_size, config.stride, config.min_nodes)),
+        list(
+            _window_iterator(
+                network_df,
+                config.window_size,
+                config.stride,
+                config.min_nodes,
+                target_windows,
+            )
+        ),
         desc="Processing windows",
     ):
         features, device_ids, feature_names = _aggregate_network_features(chunk, numeric_columns)
@@ -577,8 +606,17 @@ def _extract_graphs_from_telemetry(
     feature_cache: List[np.ndarray] = []
     metadata_feature_names: Optional[List[str]] = None
     network_df = network_df.copy()
+    target_windows = max(3, config.min_split_graphs * 3)
     for chunk in tqdm(
-        list(_window_iterator(telemetry_df, config.window_size, config.stride, config.min_nodes)),
+        list(
+            _window_iterator(
+                telemetry_df,
+                config.window_size,
+                config.stride,
+                config.min_nodes,
+                target_windows,
+            )
+        ),
         desc="Processing windows",
     ):
         features, device_ids, feature_names = _aggregate_features(chunk)
