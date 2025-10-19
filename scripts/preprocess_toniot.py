@@ -553,8 +553,17 @@ def _safe_split(indices: np.ndarray, labels: np.ndarray, test_size: float, seed:
             stratify=labels if len(np.unique(labels)) > 1 else None,
         )
     except ValueError:
-        first, second = train_test_split(indices, test_size=test_size, random_state=seed, stratify=None)
-    return np.array(first), np.array(second)
+        if indices.size <= 1:
+            return indices.astype(int), np.empty(0, dtype=int)
+        rng = np.random.default_rng(seed)
+        shuffled = rng.permutation(indices)
+        second_count = int(round(len(shuffled) * test_size))
+        second_count = max(1, second_count)
+        if second_count >= len(shuffled):
+            second_count = len(shuffled) - 1
+        second = shuffled[:second_count]
+        first = shuffled[second_count:]
+    return np.array(first, dtype=int), np.array(second, dtype=int)
 
 
 def _split_graphs(graphs: List[Data], seed: int) -> Dict[str, List[Data]]:
