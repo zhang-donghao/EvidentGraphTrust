@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch_geometric.data import Data, InMemoryDataset
@@ -88,6 +88,13 @@ class GraphTrustDataset(InMemoryDataset):
         if self._data_list_cache is not None:
             return self._data_list_cache[idx]
         return super().get(idx)
+
+    def to_list(self) -> List[Data]:
+        """Return the dataset contents as a list of ``Data`` objects."""
+
+        if self._data_list_cache is not None:
+            return [data.clone() for data in self._data_list_cache]
+        return [self.get(i).clone() for i in range(super().len())]
 
     @property
     def raw_file_names(self) -> list[str]:

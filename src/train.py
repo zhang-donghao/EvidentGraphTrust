@@ -2,19 +2,23 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
+import warnings
 from pathlib import Path
-from typing import Tuple
+from typing import List, Sequence, Tuple
 
 import torch
 from torch import nn, optim
+from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
+from torch.utils.data import Dataset
 
 if __package__ is None or __package__ == "":  # Allow ``python src/train.py``.
     repo_root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(repo_root))
 
-from src.data.datamodules import DataModuleConfig, load_dataset
+from src.data.datamodules import DataModuleConfig, GraphTrustDataset, load_dataset
 from src.models.egtn import EGTNConfig, EvidentialGraphTrustNetwork
 from src.utils.metrics import trust_evaluation
 
@@ -33,10 +37,101 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+class GraphListDataset(Dataset):
+    """Lightweight dataset wrapping an in-memory list of PyG ``Data`` objects."""
+
+    def __init__(
+        self,
+        data_list: Sequence[Data],
+        num_node_features: int,
+        num_classes: int,
+        metadata: dict,
+    ) -> None:
+        self._data_list = list(data_list)
+        self.num_node_features = num_node_features
+        self.num_classes = num_classes
+        self.metadata = metadata
+
+    def __len__(self) -> int:
+        return len(self._data_list)
+
+    def __getitem__(self, idx: int) -> Data:
+        return self._data_list[idx]
+
+
+def _synthesise_holdout(
+    train_ds: GraphTrustDataset,
+    val_ds: GraphTrustDataset,
+    test_ds: GraphTrustDataset,
+) -> Tuple[Dataset, Dataset, Dataset]:
+    if len(val_ds) > 0 and len(test_ds) > 0:
+        return train_ds, val_ds, test_ds
+
+    combined: List[Data] = []
+    combined.extend(train_ds.to_list())
+    combined.extend(val_ds.to_list())
+    combined.extend(test_ds.to_list())
+    total = len(combined)
+    if total < 3:
+        warnings.warn(
+            "Not enough graphs to create validation/test splits (need at least 3). "
+            "Consider rerunning preprocessing with a smaller window or stride to generate more samples.",
+            RuntimeWarning,
+        )
+        return train_ds, val_ds, test_ds
+
+    generator = torch.Generator().manual_seed(42)
+    permutation = torch.randperm(total, generator=generator).tolist()
+
+    val_count = max(1, math.ceil(total * 0.2))
+    test_count = max(1, math.ceil(total * 0.2))
+    max_holdout = total - 1
+    while val_count + test_count > max_holdout:
+        if val_count >= test_count and val_count > 1:
+            val_count -= 1
+        elif test_count > 1:
+            test_count -= 1
+        else:
+            break
+    train_count = total - val_count - test_count
+    if train_count < 1:
+        train_count = 1
+        remaining = total - train_count
+        val_count = max(1, remaining // 2)
+        test_count = remaining - val_count
+        if test_count == 0 and remaining > 1:
+            test_count = 1
+            val_count = remaining - test_count
+        if val_count == 0 and remaining > 0:
+            val_count = 1
+            test_count = remaining - val_count
+
+    val_idx = permutation[:val_count]
+    test_idx = permutation[val_count : val_count + test_count]
+    train_idx = permutation[val_count + test_count :]
+
+    def _gather(indices: Sequence[int]) -> List[Data]:
+        return [combined[i].clone() for i in indices]
+
+    metadata = dict(getattr(train_ds, "metadata", {}))
+    num_node_features = train_ds.num_node_features
+    num_classes = train_ds.num_classes
+    warnings.warn(
+        "Validation/test splits were empty; synthesising hold-out partitions from available graphs.",
+        RuntimeWarning,
+    )
+    return (
+        GraphListDataset(_gather(train_idx), num_node_features, num_classes, metadata),
+        GraphListDataset(_gather(val_idx), num_node_features, num_classes, metadata),
+        GraphListDataset(_gather(test_idx), num_node_features, num_classes, metadata),
+    )
+
+
 def load_splits(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader, DataLoader]:
     train_ds = load_dataset(DataModuleConfig(args.dataset_root, args.dataset_name, split="train"))
     val_ds = load_dataset(DataModuleConfig(args.dataset_root, args.dataset_name, split="val"))
     test_ds = load_dataset(DataModuleConfig(args.dataset_root, args.dataset_name, split="test"))
+    train_ds, val_ds, test_ds = _synthesise_holdout(train_ds, val_ds, test_ds)
     return (
         DataLoader(train_ds, batch_size=1, shuffle=True),
         DataLoader(val_ds, batch_size=1, shuffle=False),
