@@ -34,7 +34,9 @@
 7. **图打包**
    - 使用 PyTorch Geometric 的 `Data`/`HeteroData` 存储节点特征、边索引、边特征、标签。
    - 将多个窗口堆叠为 `InMemoryDataset`，保存为 `.pt` 文件。
-   - 预处理脚本会同时生成 `summary.json` 统计各划分图数量、节点规模、攻击比率，并在 `diagnostics.empty_splits` 中标记由于窗口不足而为空的划分，便于重新配置窗口参数。
+  - 预处理脚本会同时生成 `summary.json` 统计各划分图数量、节点规模、攻击比率，并记录窗口自动调参的结果：
+    `diagnostics.applied_window` 给出最终采用的窗口长度与步幅，`diagnostics.window_search_attempts`
+    列出逐步尝试的参数及对应图数量，若仍存在空划分则会在 `diagnostics.empty_splits` 中标记。
 
 ## 2. TON_IoT 数据集
 
@@ -63,7 +65,9 @@
 4. **标签与划分**
    - 标签来自提供的攻击标记；
   - 训练/验证：选取 70% 设备；测试：剩余 30% 未见设备；
-  - 当窗口数量极少导致验证/测试集为空时，预处理脚本会在 `diagnostics.empty_splits` 中给出提示；训练脚本会直接报错，提示重新执行预处理。请调整 `--window-size`、`--stride` 或放宽 `--min-nodes` 以生成更多窗口，确保每个划分至少包含 1 个图后再训练。
+  - 当窗口数量极少导致验证/测试集为空时，脚本会自动缩短窗口/步幅或退化为按行切分；若所有尝试均失败，
+    `diagnostics.window_search_attempts` 会说明已尝试的组合，`diagnostics.empty_splits` 列出仍为空的划分，此时需手动调整
+    `--window-size`、`--stride` 或放宽 `--min-nodes` 生成更多窗口后再训练。
   - 确保每类攻击在测试集中出现。
 
 5. **图存储**

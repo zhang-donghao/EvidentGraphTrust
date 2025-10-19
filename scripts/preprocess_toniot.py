@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -267,19 +267,40 @@ def _load_network(config: TONTConfig) -> pd.DataFrame:
     return df
 
 
-def _window_iterator(df: pd.DataFrame, window: float, stride: float) -> Iterable[pd.DataFrame]:
-    if "timestamp" not in df.columns:
+def _row_fallback_windows(df: pd.DataFrame, min_chunk_size: int) -> Iterable[pd.DataFrame]:
+    if df.empty:
         yield df
+        return
+    if min_chunk_size <= 0:
+        min_chunk_size = 1
+    chunk_count = max(1, min(10, len(df) // max(1, min_chunk_size)))
+    if chunk_count <= 1 and len(df) >= min_chunk_size * 2:
+        chunk_count = 2
+    if chunk_count <= 2 and len(df) >= min_chunk_size * 3:
+        chunk_count = 3
+    if chunk_count <= 1:
+        yield df
+        return
+    for chunk in np.array_split(df.sort_index(), chunk_count):
+        if not chunk.empty:
+            yield chunk
+
+
+def _window_iterator(
+    df: pd.DataFrame, window: float, stride: float, min_chunk_size: int
+) -> Iterable[pd.DataFrame]:
+    if "timestamp" not in df.columns:
+        yield from _row_fallback_windows(df, min_chunk_size)
         return
     timestamp_series = pd.to_numeric(df["timestamp"], errors="coerce")
     valid = timestamp_series.dropna()
     if valid.empty:
-        yield df
+        yield from _row_fallback_windows(df, min_chunk_size)
         return
     start = float(valid.min())
     end = float(valid.max())
     if not np.isfinite(start) or not np.isfinite(end) or end - start < window:
-        yield df
+        yield from _row_fallback_windows(df, min_chunk_size)
         return
     current = start
     while current <= end:
@@ -451,7 +472,10 @@ def _extract_graphs_from_network(
     graphs: List[Data] = []
     feature_cache: List[np.ndarray] = []
     metadata_feature_names: Optional[List[str]] = None
-    for chunk in tqdm(list(_window_iterator(network_df, config.window_size, config.stride)), desc="Processing windows"):
+    for chunk in tqdm(
+        list(_window_iterator(network_df, config.window_size, config.stride, config.min_nodes)),
+        desc="Processing windows",
+    ):
         features, device_ids, feature_names = _aggregate_network_features(chunk, numeric_columns)
         if features.size == 0 or len(device_ids) < config.min_nodes:
             continue
@@ -503,7 +527,10 @@ def _extract_graphs_from_telemetry(
     feature_cache: List[np.ndarray] = []
     metadata_feature_names: Optional[List[str]] = None
     network_df = network_df.copy()
-    for chunk in tqdm(list(_window_iterator(telemetry_df, config.window_size, config.stride)), desc="Processing windows"):
+    for chunk in tqdm(
+        list(_window_iterator(telemetry_df, config.window_size, config.stride, config.min_nodes)),
+        desc="Processing windows",
+    ):
         features, device_ids, feature_names = _aggregate_features(chunk)
         if features.size == 0 or len(device_ids) < config.min_nodes:
             continue
@@ -585,10 +612,97 @@ def _split_graphs(graphs: List[Data], seed: int) -> Tuple[Dict[str, List[Data]],
 
     empty_splits = [name for name, items in split.items() if len(items) == 0]
     if empty_splits:
-        diagnostics["empty_splits"] = empty_splits
-        diagnostics["total_graphs"] = len(graphs)
+        redistribution_log: List[Tuple[str, str]] = []
+        for target in empty_splits:
+            donors = sorted(
+                [name for name, items in split.items() if len(items) > 1 and name != target],
+                key=lambda name: len(split[name]),
+                reverse=True,
+            )
+            moved = False
+            for donor in donors:
+                if split[donor]:
+                    split[target].append(split[donor].pop())
+                    redistribution_log.append((donor, target))
+                    moved = True
+                    break
+            if not moved:
+                continue
+        empty_splits = [name for name, items in split.items() if len(items) == 0]
+        if empty_splits:
+            diagnostics["empty_splits"] = empty_splits
+            diagnostics["total_graphs"] = len(graphs)
+        elif redistribution_log:
+            diagnostics["redistribution"] = redistribution_log
 
     return split, diagnostics
+
+
+def _candidate_configs(config: TONTConfig) -> Iterable[TONTConfig]:
+    scales = [1.0, 0.5, 0.25, 0.125]
+    seen: set[Tuple[float, float]] = set()
+    for scale in scales:
+        window = max(30.0, float(config.window_size * scale))
+        stride = max(10.0, float(config.stride * scale))
+        if stride > window:
+            stride = window
+        key = (round(window, 4), round(stride, 4))
+        if key in seen:
+            continue
+        seen.add(key)
+        yield replace(config, window_size=window, stride=stride)
+
+
+def _generate_graphs_with_split(
+    telemetry_df: Optional[pd.DataFrame],
+    network_df: pd.DataFrame,
+    config: TONTConfig,
+) -> Tuple[List[Data], Dict[str, object], Dict[str, List[Data]], Dict[str, object], TONTConfig, List[Dict[str, object]]]:
+    attempts: List[Dict[str, object]] = []
+    last_error: Optional[str] = None
+    for candidate in _candidate_configs(config):
+        try:
+            if telemetry_df is None:
+                graphs, metadata = _extract_graphs_from_network(network_df, candidate)
+            else:
+                graphs, metadata = _extract_graphs_from_telemetry(telemetry_df, network_df, candidate)
+        except RuntimeError as exc:
+            last_error = str(exc)
+            attempts.append(
+                {
+                    "window_size": candidate.window_size,
+                    "stride": candidate.stride,
+                    "error": last_error,
+                }
+            )
+            continue
+
+        summary = {
+            "window_size": candidate.window_size,
+            "stride": candidate.stride,
+            "num_graphs": len(graphs),
+        }
+        if len(graphs) < 3:
+            summary["reason"] = "insufficient_graphs"
+            attempts.append(summary)
+            continue
+        split, diagnostics = _split_graphs(graphs, candidate.seed)
+        empty_splits = diagnostics.get("empty_splits")
+        if empty_splits:
+            summary["empty_splits"] = empty_splits
+            attempts.append(summary)
+            continue
+        return graphs, metadata, split, diagnostics, candidate, attempts
+    detail = {
+        "attempts": attempts,
+    }
+    if last_error is not None:
+        detail["last_error"] = last_error
+    raise RuntimeError(
+        "TON_IoT preprocessing could not produce non-empty train/val/test splits. "
+        "Review window/stride parameters or lower --min-nodes. Details: "
+        f"{detail}"
+    )
 
 
 def _save_split(
@@ -619,11 +733,23 @@ def main() -> None:
     config = parse_args()
     telemetry_df = _load_telemetry(config)
     network_df = _load_network(config)
-    if telemetry_df is None:
-        graphs, metadata = _extract_graphs_from_network(network_df, config)
-    else:
-        graphs, metadata = _extract_graphs_from_telemetry(telemetry_df, network_df, config)
-    split, diagnostics = _split_graphs(graphs, config.seed)
+    (
+        graphs,
+        metadata,
+        split,
+        diagnostics,
+        applied_config,
+        attempts,
+    ) = _generate_graphs_with_split(telemetry_df, network_df, config)
+    diagnostics.setdefault("applied_window", {})
+    diagnostics["applied_window"].update(
+        {
+            "window_size": applied_config.window_size,
+            "stride": applied_config.stride,
+        }
+    )
+    if attempts:
+        diagnostics.setdefault("window_search_attempts", attempts)
     dataset_root = config.output_root / "toni_iot"
     _save_split(split, metadata, dataset_root, diagnostics)
     print(f"Saved TON_IoT graphs to {dataset_root / 'processed'}")
