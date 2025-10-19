@@ -28,6 +28,7 @@ class GraphTrustDataset(InMemoryDataset):
         self.metadata: Dict[str, Any] = {}
         self._num_node_features = 0
         self._num_classes = 0
+        self._data_list_cache: Optional[list[Data]] = None
         super().__init__(root, transform=None, pre_transform=None)
         try:
             loaded = torch.load(self.processed_paths[0], weights_only=False)
@@ -42,14 +43,22 @@ class GraphTrustDataset(InMemoryDataset):
             # Assume legacy (data, slices) tuple
             data_list = None
         if data_list is not None:
-            self.data, self.slices = self.collate(data_list)
+            self._data_list_cache = list(data_list)
+            if self._data_list_cache:
+                self.data, self.slices = self.collate(self._data_list_cache)
+            else:
+                # PyG expects ``data``/``slices`` attributes even for empty datasets.
+                self.data = Data()
+                self.slices = {}
         else:
             self.data, self.slices = loaded  # type: ignore[assignment]
 
         self._infer_dataset_properties()
 
     def _infer_dataset_properties(self) -> None:
-        data_obj = getattr(self, "_data", self.data)
+        data_obj = getattr(self, "_data", None)
+        if data_obj is None:
+            data_obj = getattr(self, "data", Data())
         if hasattr(data_obj, "x") and getattr(data_obj, "x") is not None:
             self._num_node_features = data_obj.x.size(-1)  # type: ignore[attr-defined]
         else:
@@ -69,6 +78,16 @@ class GraphTrustDataset(InMemoryDataset):
     @property
     def num_classes(self) -> int:  # type: ignore[override]
         return self._num_classes
+
+    def len(self) -> int:  # type: ignore[override]
+        if self._data_list_cache is not None:
+            return len(self._data_list_cache)
+        return super().len()
+
+    def get(self, idx: int) -> Data:  # type: ignore[override]
+        if self._data_list_cache is not None:
+            return self._data_list_cache[idx]
+        return super().get(idx)
 
     @property
     def raw_file_names(self) -> list[str]:
