@@ -578,47 +578,15 @@ def _split_graphs(graphs: List[Data], seed: int) -> Tuple[Dict[str, List[Data]],
         "test": [graphs[i] for i in test_idx],
     }
 
-    diagnostics: Dict[str, object] = {"synthetic_duplicates": []}
+    diagnostics: Dict[str, object] = {}
 
     if not graphs:
         return split, diagnostics
 
-    rng = np.random.default_rng(seed)
-
-    def _duplicate_graph(source_split: str, target_split: str) -> None:
-        source_graphs = split.get(source_split, [])
-        if not source_graphs:
-            return
-        template = source_graphs[rng.integers(0, len(source_graphs))]
-        cloned = template.clone()
-        cloned.synthetic_duplicate = True  # type: ignore[attr-defined]
-        cloned.synthetic_source = source_split  # type: ignore[attr-defined]
-        split[target_split].append(cloned)
-        diagnostics["synthetic_duplicates"].append(
-            {
-                "target_split": target_split,
-                "source_split": source_split,
-                "original_window_start": getattr(template, "window_start", None),
-                "original_window_end": getattr(template, "window_end", None),
-            }
-        )
-
-    # Ensure every split has at least one graph when any graphs exist.
-    for name in ("val", "test"):
-        if split[name]:
-            continue
-        # Prefer duplicating from train, otherwise fall back to the other non-empty split.
-        if split["train"]:
-            _duplicate_graph("train", name)
-        else:
-            fallback = "val" if name == "test" else "test"
-            if split[fallback]:
-                _duplicate_graph(fallback, name)
-
-    # In the degenerate case of a single graph where train ended empty, seed the train split as well.
-    if not split["train"] and (split["val"] or split["test"]):
-        source = "val" if split["val"] else "test"
-        _duplicate_graph(source, "train")
+    empty_splits = [name for name, items in split.items() if len(items) == 0]
+    if empty_splits:
+        diagnostics["empty_splits"] = empty_splits
+        diagnostics["total_graphs"] = len(graphs)
 
     return split, diagnostics
 
@@ -638,13 +606,10 @@ def _save_split(
             "num_graphs": len(graphs),
             "avg_nodes": float(np.mean([g.num_nodes for g in graphs])) if graphs else 0.0,
             "attack_ratio": float(np.mean([g.y.float().mean().item() for g in graphs])) if graphs else 0.0,
-            "synthetic_graphs": int(
-                sum(1 for g in graphs if getattr(g, "synthetic_duplicate", False))
-            ),
         }
         for name, graphs in split.items()
     }
-    if diagnostics and diagnostics.get("synthetic_duplicates"):
+    if diagnostics:
         summary["diagnostics"] = diagnostics
     with open(processed_dir / "summary.json", "w", encoding="utf-8") as fp:
         json.dump(summary, fp, indent=2)

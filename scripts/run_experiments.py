@@ -77,6 +77,28 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    summary_path = (
+        args.dataset_root / args.dataset_name / "processed" / "summary.json"
+    )
+    if summary_path.exists():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            summary = {}
+        empty = [
+            name
+            for name in ("train", "val", "test")
+            if isinstance(summary.get(name), dict) and summary[name].get("num_graphs", 0) == 0
+        ]
+        if empty:
+            raise RuntimeError(
+                "Dataset split(s) "
+                + ", ".join(sorted(empty))
+                + " contain zero graphs according to processed/summary.json. "
+                "Regenerate the dataset with scripts/preprocess_toniot.py using a smaller window "
+                "or stride before running experiments."
+            )
+
     base_cmd = [
         sys.executable,
         "src/train.py",
