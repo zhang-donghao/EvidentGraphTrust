@@ -26,6 +26,8 @@ class GraphTrustDataset(InMemoryDataset):
     def __init__(self, root: Path, split: str) -> None:
         self.split = split
         self.metadata: Dict[str, Any] = {}
+        self._num_node_features = 0
+        self._num_classes = 0
         super().__init__(root, transform=None, pre_transform=None)
         try:
             loaded = torch.load(self.processed_paths[0], weights_only=False)
@@ -47,17 +49,26 @@ class GraphTrustDataset(InMemoryDataset):
         self._infer_dataset_properties()
 
     def _infer_dataset_properties(self) -> None:
-        if hasattr(self.data, "x") and getattr(self.data, "x") is not None:
-            self.num_node_features = self.data.x.size(-1)  # type: ignore[attr-defined]
+        data_obj = getattr(self, "_data", self.data)
+        if hasattr(data_obj, "x") and getattr(data_obj, "x") is not None:
+            self._num_node_features = data_obj.x.size(-1)  # type: ignore[attr-defined]
         else:
-            self.num_node_features = self.metadata.get("num_features", 0)
-        if hasattr(self.data, "y") and getattr(self.data, "y") is not None:
-            y_tensor = self.data.y
+            self._num_node_features = int(self.metadata.get("num_features", 0))
+        if hasattr(data_obj, "y") and getattr(data_obj, "y") is not None:
+            y_tensor = data_obj.y
             num_classes = int(y_tensor.max().item() + 1) if y_tensor.numel() > 0 else 0
         else:
             num_classes = 0
         num_classes = max(num_classes, int(self.metadata.get("num_classes", 0)))
-        self.num_classes = num_classes
+        self._num_classes = num_classes
+
+    @property
+    def num_node_features(self) -> int:  # type: ignore[override]
+        return self._num_node_features
+
+    @property
+    def num_classes(self) -> int:  # type: ignore[override]
+        return self._num_classes
 
     @property
     def raw_file_names(self) -> list[str]:
