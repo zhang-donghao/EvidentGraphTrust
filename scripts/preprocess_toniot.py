@@ -78,7 +78,9 @@ class TONTConfig:
     window_size: float = 300.0
     stride: float = 120.0
     min_nodes: int = 4
-    min_split_graphs: int = 10
+    min_split_graphs: int = 30
+    min_class_per_split: int = 20
+    time_buffer: int = 0
     seed: int = 42
     network_file: Optional[Path] = None
 
@@ -99,10 +101,28 @@ def parse_args() -> TONTConfig:
     parser.add_argument(
         "--min-split-graphs",
         type=int,
-        default=10,
+        default=30,
         help=(
             "Minimum number of graphs required in each split. The preprocessor will automatically "
             "search for smaller windows/strides until this threshold is met."
+        ),
+    )
+    parser.add_argument(
+        "--min-class-per-split",
+        type=int,
+        default=20,
+        help=(
+            "Minimum number of positive and negative graphs required in each split. "
+            "Candidates that do not satisfy this constraint are rejected."
+        ),
+    )
+    parser.add_argument(
+        "--time-buffer",
+        type=int,
+        default=0,
+        help=(
+            "Number of graphs to drop at the temporal boundaries between splits to reduce window "
+            "overlap. Set to 0 to disable temporal buffering."
         ),
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for data splits")
@@ -149,6 +169,8 @@ def parse_args() -> TONTConfig:
         min_nodes=args.min_nodes,
         seed=args.seed,
         min_split_graphs=max(1, args.min_split_graphs),
+        min_class_per_split=max(1, args.min_class_per_split),
+        time_buffer=max(0, args.time_buffer),
         network_file=network_file,
     )
 
@@ -621,7 +643,7 @@ def _safe_split(indices: np.ndarray, labels: np.ndarray, test_size: float, seed:
     return np.array(first, dtype=int), np.array(second, dtype=int)
 
 
-def _split_graphs(graphs: List[Data], seed: int) -> Tuple[Dict[str, List[Data]], Dict[str, object]]:
+def _stratified_random_split(graphs: List[Data], seed: int) -> Tuple[Dict[str, List[Data]], Dict[str, object]]:
     indices = np.arange(len(graphs))
     graph_labels = np.array([_graph_label(data) for data in graphs])
     train_idx, temp_idx = _safe_split(indices, graph_labels, test_size=0.3, seed=seed)
@@ -633,7 +655,7 @@ def _split_graphs(graphs: List[Data], seed: int) -> Tuple[Dict[str, List[Data]],
         "test": [graphs[i] for i in test_idx],
     }
 
-    diagnostics: Dict[str, object] = {}
+    diagnostics: Dict[str, object] = {"split_method": "stratified_random"}
 
     if not graphs:
         return split, diagnostics
@@ -723,6 +745,142 @@ def _split_graphs(graphs: List[Data], seed: int) -> Tuple[Dict[str, List[Data]],
     return split, diagnostics
 
 
+def _allocate_temporal_counts(total: int, ratios: Tuple[float, float, float]) -> List[int]:
+    if total < len(ratios):
+        raise ValueError("insufficient_graphs_for_temporal_split")
+
+    raw = np.array(ratios, dtype=float) * float(total)
+    counts = np.floor(raw).astype(int)
+    remainder = int(total - counts.sum())
+    if remainder > 0:
+        fractional = raw - counts
+        order = np.argsort(-fractional)
+        for idx in order[:remainder]:
+            counts[idx] += 1
+    counts = counts.tolist()
+
+    for idx in range(len(counts)):
+        if counts[idx] == 0:
+            donor = int(np.argmax(counts))
+            if counts[donor] <= 1:
+                raise ValueError("unable_to_allocate_counts")
+            counts[donor] -= 1
+            counts[idx] += 1
+
+    if sum(counts) != total:
+        counts[-1] += total - sum(counts)
+
+    if any(count <= 0 for count in counts):
+        raise ValueError("temporal_split_produced_empty_segment")
+    return counts
+
+
+def _temporal_split_graphs(
+    graphs: List[Data], config: TONTConfig
+) -> Tuple[Dict[str, List[Data]], Dict[str, object]]:
+    diagnostics: Dict[str, object] = {"split_method": "temporal"}
+    split_names = ("train", "val", "test")
+    if not graphs:
+        return {name: [] for name in split_names}, diagnostics
+
+    window_map: Dict[int, Tuple[float, float]] = {}
+    ordering: List[Tuple[int, float]] = []
+    for idx, graph in enumerate(graphs):
+        start = getattr(graph, "window_start", None)
+        if start is None or not np.isfinite(float(start)):
+            raise ValueError("missing_window_start")
+        start_f = float(start)
+        end = getattr(graph, "window_end", None)
+        end_f = float(end) if end is not None and np.isfinite(float(end)) else start_f
+        if end_f < start_f:
+            end_f = start_f
+        window_map[idx] = (start_f, end_f)
+        ordering.append((idx, start_f))
+
+    ordering.sort(key=lambda item: item[1])
+    sorted_indices = [idx for idx, _ in ordering]
+    counts = _allocate_temporal_counts(len(sorted_indices), (0.6, 0.2, 0.2))
+
+    train_end = counts[0]
+    val_end = counts[0] + counts[1]
+    train_idx = sorted_indices[:train_end]
+    val_idx = sorted_indices[train_end:val_end]
+    test_idx = sorted_indices[val_end:]
+
+    if config.time_buffer > 0:
+        buffer = config.time_buffer
+        removed = 0
+        if len(train_idx) > buffer:
+            train_idx = train_idx[:-buffer]
+            removed += buffer
+        if len(val_idx) > buffer:
+            val_idx = val_idx[buffer:]
+            removed += buffer
+        if len(val_idx) > buffer:
+            val_idx = val_idx[:-buffer]
+            removed += buffer
+        if len(test_idx) > buffer:
+            test_idx = test_idx[buffer:]
+            removed += buffer
+        if removed:
+            if any(len(indices) == 0 for indices in (train_idx, val_idx, test_idx)):
+                raise ValueError("buffer_removed_all")
+            diagnostics["temporal_buffer"] = {"removed_graphs": int(removed)}
+
+    split = {
+        "train": [graphs[i] for i in train_idx],
+        "val": [graphs[i] for i in val_idx],
+        "test": [graphs[i] for i in test_idx],
+    }
+
+    boundaries: Dict[str, Dict[str, float]] = {}
+    for name, indices in zip(split_names, (train_idx, val_idx, test_idx)):
+        if not indices:
+            continue
+        starts = [window_map[i][0] for i in indices]
+        ends = [window_map[i][1] for i in indices]
+        boundaries[name] = {"start": float(min(starts)), "end": float(max(ends))}
+    if boundaries:
+        diagnostics["split_time_boundaries"] = boundaries
+
+    overlaps: List[Dict[str, float]] = []
+    order_pairs = [("train", "val"), ("val", "test")]
+    for first, second in order_pairs:
+        first_bounds = boundaries.get(first)
+        second_bounds = boundaries.get(second)
+        if not first_bounds or not second_bounds:
+            continue
+        if first_bounds["end"] > second_bounds["start"]:
+            overlaps.append(
+                {
+                    "pair": (first, second),
+                    "first_end": first_bounds["end"],
+                    "second_start": second_bounds["start"],
+                }
+            )
+    if overlaps:
+        diagnostics["temporal_overlap"] = overlaps
+
+    total_label_counts = _label_counts(graphs)
+    final_counts = {name: _label_counts(items) for name, items in split.items()}
+    diagnostics["label_distribution"] = {
+        name: {"neg": counts[0], "pos": counts[1]} for name, counts in final_counts.items()
+    }
+    diagnostics["total_label_counts"] = {"neg": total_label_counts[0], "pos": total_label_counts[1]}
+
+    return split, diagnostics
+
+
+def _split_graphs(graphs: List[Data], config: TONTConfig) -> Tuple[Dict[str, List[Data]], Dict[str, object]]:
+    try:
+        return _temporal_split_graphs(graphs, config)
+    except ValueError as exc:
+        split, diagnostics = _stratified_random_split(graphs, config.seed)
+        diagnostics.setdefault("split_method", "stratified_random")
+        diagnostics.setdefault("fallback_reason", str(exc))
+        return split, diagnostics
+
+
 def _candidate_configs(config: TONTConfig) -> Iterable[TONTConfig]:
     window_scales = [1.0, 0.75, 0.5, 0.25, 0.125]
     stride_scales = [1.0, 0.5, 0.25, 0.125]
@@ -776,7 +934,7 @@ def _generate_graphs_with_split(
             summary["reason"] = "insufficient_graphs"
             attempts.append(summary)
             continue
-        split, diagnostics = _split_graphs(graphs, candidate.seed)
+        split, diagnostics = _split_graphs(graphs, candidate)
         split_sizes = {name: len(items) for name, items in split.items()}
         summary["split_sizes"] = split_sizes
         empty_splits = diagnostics.get("empty_splits")
@@ -791,19 +949,32 @@ def _generate_graphs_with_split(
             attempts.append(summary)
             continue
         label_dist = diagnostics.get("label_distribution", {})
-        coverage_ok = True
-        for split_name in ("val", "test"):
-            counts = label_dist.get(split_name)
-            if not counts:
-                continue
-            if counts.get("neg", 0) == 0 or counts.get("pos", 0) == 0:
-                coverage_ok = False
-                break
-        if not coverage_ok:
-            summary["reason"] = "class_gap"
+        coverage_failures: List[Dict[str, object]] = []
+        for split_name, counts in label_dist.items():
+            for label_key in ("neg", "pos"):
+                if counts.get(label_key, 0) < candidate.min_class_per_split:
+                    coverage_failures.append(
+                        {
+                            "split": split_name,
+                            "label": label_key,
+                            "count": counts.get(label_key, 0),
+                            "required": candidate.min_class_per_split,
+                        }
+                    )
+        if coverage_failures:
+            summary["reason"] = "class_below_min"
             summary["label_distribution"] = label_dist
+            summary["min_class_per_split"] = candidate.min_class_per_split
+            summary["coverage_failures"] = coverage_failures
             attempts.append(summary)
             continue
+        diagnostics.setdefault("class_thresholds", {})
+        diagnostics["class_thresholds"].update(
+            {
+                "min_split_graphs": candidate.min_split_graphs,
+                "min_class_per_split": candidate.min_class_per_split,
+            }
+        )
         return graphs, metadata, split, diagnostics, candidate, attempts
     detail = {
         "attempts": attempts,
