@@ -101,11 +101,12 @@ python src/train.py --dataset-root data --dataset-name toni_iot --model egtn --d
 > python src/train.py --dataset-root data --dataset-name veremi --epochs 100
 > python src/train.py --dataset-root data --dataset-name toni_iot --epochs 100
 > ```
-> 若某一划分（例如 TON_IoT 的验证/测试集）因窗口数量过少而为空，训练脚本会直接报错
-> 并提示重新运行预处理。请尝试减小 `--window-size`、`--stride` 或放宽 `--min-nodes`
-> 以生成更多窗口后再训练。预处理脚本会在 `data/<dataset>/processed/` 目录下生成
-> `summary.json`，其中 `diagnostics.empty_splits` 会列出为空的划分，便于检查并迭代参数设
-> 置。
+> 若某一划分（例如 TON_IoT 的验证/测试集）因窗口数量过少而为空，训练脚本会在控制台
+> 发出警告，并临时复制训练集图构造验证/测试划分以保证流程可运行，同时在指标 JSON 中
+> 标记 `synthetic_split=true`。此结果仅用于诊断，建议尽快重新运行预处理，减小
+> `--window-size`、`--stride` 或放宽 `--min-nodes` 生成更多窗口后再训练。预处理脚本会在
+> `data/<dataset>/processed/` 目录下生成 `summary.json`，其中 `diagnostics.empty_splits`
+> 会列出为空的划分，便于检查并迭代参数设置。
 
 2. **建模与训练**
    - 使用 PyTorch Geometric 构建模型，支持多 GPU/多进程训练。

@@ -68,8 +68,14 @@ def load_metrics(run_dir: Path) -> Dict[str, float]:
             metrics = json.load(fp)
     except json.JSONDecodeError:
         return {}
-    filtered = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
+    filtered = {
+        k: v for k, v in metrics.items() if isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
     filtered["skipped"] = metrics.get("skipped", False)
+    if "synthetic_split" in metrics:
+        filtered["synthetic_split"] = bool(metrics["synthetic_split"])
+    if "split_size" in metrics and isinstance(metrics["split_size"], (int, float)):
+        filtered["split_size"] = int(metrics["split_size"])
     return filtered
 
 
@@ -91,12 +97,11 @@ def main() -> None:
             if isinstance(summary.get(name), dict) and summary[name].get("num_graphs", 0) == 0
         ]
         if empty:
-            raise RuntimeError(
-                "Dataset split(s) "
+            print(
+                "Warning: split(s) "
                 + ", ".join(sorted(empty))
-                + " contain zero graphs according to processed/summary.json. "
-                "Regenerate the dataset with scripts/preprocess_toniot.py using a smaller window "
-                "or stride before running experiments."
+                + " have zero graphs. Training will synthesise holdout graphs from the train split; "
+                "re-run preprocessing with more windows for stable metrics."
             )
 
     base_cmd = [

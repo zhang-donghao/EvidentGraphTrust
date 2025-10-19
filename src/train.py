@@ -59,23 +59,40 @@ def load_splits(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader, DataL
     train_ds = load_dataset(DataModuleConfig(args.dataset_root, args.dataset_name, split="train"))
     val_ds = load_dataset(DataModuleConfig(args.dataset_root, args.dataset_name, split="val"))
     test_ds = load_dataset(DataModuleConfig(args.dataset_root, args.dataset_name, split="test"))
-    splits = {"train": train_ds, "val": val_ds, "test": test_ds}
-    missing = [name for name, dataset in splits.items() if len(dataset) == 0]
+
+    datasets: Dict[str, object] = {"train": train_ds, "val": val_ds, "test": test_ds}
+    synthetic_splits: List[str] = []
+
+    missing = [name for name, dataset in datasets.items() if len(dataset) == 0]
     if missing:
-        raise RuntimeError(
+        base_graphs = train_ds.to_list()
+        if not base_graphs:
+            raise RuntimeError(
+                "All dataset splits are empty; unable to synthesise holdouts. Rerun preprocessing with a smaller window, "
+                "stride, or --min-nodes setting to generate graphs before training."
+            )
+        warnings.warn(
             "Dataset split(s) "
             + ", ".join(sorted(missing))
-            + " are empty. Rerun preprocessing with a smaller window, stride, or --min-nodes "
-            "setting to generate additional graphs before training."
+            + " are empty. Synthesising holdout graphs from the training split for diagnostic purposes. "
+            "Re-run preprocessing with more windows for reliable evaluation metrics."
         )
+        target_size = max(1, len(base_graphs))
+        for name in missing:
+            synthetic = [base_graphs[idx % len(base_graphs)].clone() for idx in range(target_size)]
+            datasets[name] = synthetic
+            synthetic_splits.append(name)
+
     metadata = {
         "num_node_features": train_ds.num_node_features,
         "num_classes": train_ds.num_classes,
+        "synthetic_splits": synthetic_splits,
     }
+
     return (
-        DataLoader(train_ds, batch_size=1, shuffle=True),
-        DataLoader(val_ds, batch_size=1, shuffle=False),
-        DataLoader(test_ds, batch_size=1, shuffle=False),
+        DataLoader(datasets["train"], batch_size=1, shuffle=True),
+        DataLoader(datasets["val"], batch_size=1, shuffle=False),
+        DataLoader(datasets["test"], batch_size=1, shuffle=False),
         metadata,
     )
 
@@ -155,6 +172,7 @@ def evaluate(
     device: torch.device,
     evidential: bool,
     disable_reg: bool,
+    synthetic: bool = False,
 ) -> Dict[str, object]:
     model.eval()
     criterion = nn.CrossEntropyLoss()
@@ -172,6 +190,8 @@ def evaluate(
             "skipped": True,
             "reason": "No graphs available for this split.",
             "details": {},
+            "synthetic_split": synthetic,
+            "split_size": dataset_size,
         }
 
     collected: Dict[str, List[torch.Tensor]] = {"alpha": [], "probs": [], "preds": [], "labels": []}
@@ -221,6 +241,8 @@ def evaluate(
         "probs": probs.numpy().tolist(),
         "preds": preds.numpy().tolist(),
     }
+    metrics["synthetic_split"] = synthetic
+    metrics["split_size"] = dataset_size
     return metrics
 
 
@@ -310,7 +332,14 @@ def main() -> None:
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_epoch(model, train_loader, optimizer, device, evidential, args.disable_evidence_regularizer)
-        val_metrics = evaluate(model, val_loader, device, evidential, args.disable_evidence_regularizer)
+        val_metrics = evaluate(
+            model,
+            val_loader,
+            device,
+            evidential,
+            args.disable_evidence_regularizer,
+            synthetic="val" in metadata.get("synthetic_splits", []),
+        )
         val_loss = float(val_metrics.get("loss", float("nan")))
         history.append(
             {
@@ -319,25 +348,42 @@ def main() -> None:
                 "val_loss": val_loss,
                 "val_ece": float(val_metrics.get("ece", float("nan"))),
                 "val_accuracy": float(val_metrics.get("accuracy", float("nan"))),
+                "val_synthetic": bool(val_metrics.get("synthetic_split", False)),
             }
         )
-        val_message = " | ".join(
-            [
-                f"Epoch {epoch:03d}",
-                f"Train Loss: {train_loss:.4f}",
-                f"Val Loss: {val_metrics.get('loss', float('nan')):.4f}" if not val_metrics.get("skipped") else "Val Loss: n/a",
-                f"Val Acc: {val_metrics.get('accuracy', float('nan')):.4f}" if not val_metrics.get("skipped") else "Val Acc: n/a",
-                f"Val ECE: {val_metrics.get('ece', float('nan')):.4f}" if not val_metrics.get("skipped") else "Val ECE: n/a",
-            ]
-        )
+        message_parts = [f"Epoch {epoch:03d}", f"Train Loss: {train_loss:.4f}"]
+        if val_metrics.get("skipped"):
+            message_parts.extend(["Val Loss: n/a", "Val Acc: n/a", "Val ECE: n/a"])
+        else:
+            suffix = " (synthetic)" if val_metrics.get("synthetic_split") else ""
+            message_parts.append(f"Val Loss{suffix}: {val_metrics['loss']:.4f}")
+            message_parts.append(f"Val Acc: {val_metrics['accuracy']:.4f}")
+            message_parts.append(f"Val ECE: {val_metrics['ece']:.4f}")
+        val_message = " | ".join(message_parts)
         print(val_message)
         if not val_metrics.get("skipped") and val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), run_dir / "best_model.pt")
 
-    test_metrics = evaluate(model, test_loader, device, evidential, args.disable_evidence_regularizer)
+    test_metrics = evaluate(
+        model,
+        test_loader,
+        device,
+        evidential,
+        args.disable_evidence_regularizer,
+        synthetic="test" in metadata.get("synthetic_splits", []),
+    )
     if test_metrics.get("skipped"):
         print("Test metrics skipped: no graphs available for evaluation.")
+    elif test_metrics.get("synthetic_split"):
+        print(
+            "Test metrics computed on a synthetic holdout. Regenerate preprocessing outputs with more windows for stable "
+            "evaluation."
+        )
+        print(
+            f"Test metrics (synthetic): accuracy={test_metrics['accuracy']:.4f}, f1={test_metrics['f1']:.4f}, "
+            f"ece={test_metrics['ece']:.4f}"
+        )
     else:
         print(f"Test metrics: accuracy={test_metrics['accuracy']:.4f}, f1={test_metrics['f1']:.4f}, ece={test_metrics['ece']:.4f}")
 
