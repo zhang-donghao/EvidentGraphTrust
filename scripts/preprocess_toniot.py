@@ -59,24 +59,49 @@ class TONTConfig:
     stride: float = 120.0
     min_nodes: int = 4
     seed: int = 42
+    network_file: Optional[Path] = None
 
 
 def parse_args() -> TONTConfig:
     parser = argparse.ArgumentParser(description="Preprocess TON_IoT dataset")
-    parser.add_argument("--raw-root", type=Path, required=True, help="Directory containing TON_IoT CSV files")
+    parser.add_argument(
+        "--raw-root",
+        type=Path,
+        default=Path("src/data"),
+        help="Directory containing TON_IoT CSV files (defaults to repo src/data)",
+    )
     parser.add_argument("--output-root", type=Path, required=True, help="Directory to store processed dataset")
     parser.add_argument("--window-size", type=float, default=300.0, help="Window length (seconds) for telemetry aggregation")
     parser.add_argument("--stride", type=float, default=120.0, help="Sliding window stride in seconds")
     parser.add_argument("--min-nodes", type=int, default=4, help="Minimum number of devices per graph")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for data splits")
+    parser.add_argument(
+        "--network-file",
+        type=Path,
+        default=None,
+        help="Explicit path to Train_Test_Network.csv (defaults to <raw-root>/train_test_network.csv if present)",
+    )
     args = parser.parse_args()
+    raw_root = args.raw_root
+    network_file: Optional[Path] = args.network_file
+    if network_file is None:
+        candidates = [raw_root / "train_test_network.csv", raw_root / "Train_Test_Network.csv"]
+        for candidate in candidates:
+            if candidate.exists():
+                network_file = candidate
+                break
+        else:
+            if raw_root.is_file() and raw_root.suffix.lower() == ".csv":
+                network_file = raw_root
+                raw_root = raw_root.parent
     return TONTConfig(
-        raw_root=args.raw_root,
+        raw_root=raw_root,
         output_root=args.output_root,
         window_size=args.window_size,
         stride=args.stride,
         min_nodes=args.min_nodes,
         seed=args.seed,
+        network_file=network_file,
     )
 
 
@@ -112,6 +137,13 @@ def _reduce_label_series(series: pd.Series, normal_tokens: Optional[Sequence[str
 
 
 def _load_csvs(root: Path, pattern: str) -> List[pd.DataFrame]:
+    if root.is_file():
+        try:
+            return [pd.read_csv(root)]
+        except pd.errors.EmptyDataError:
+            return []
+    if not root.exists():
+        return []
     files = sorted(root.glob(pattern))
     frames = []
     for file in files:
@@ -149,9 +181,37 @@ def _load_telemetry(config: TONTConfig) -> Optional[pd.DataFrame]:
 
 
 def _load_network(config: TONTConfig) -> pd.DataFrame:
-    network_frames = _load_csvs(config.raw_root, "**/*Network*.csv")
-    if not network_frames:
-        network_frames = _load_csvs(config.raw_root, "**/*network*.csv")
+    network_frames: List[pd.DataFrame] = []
+    seen_paths = set()
+
+    def _append_from_file(path: Path) -> None:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved in seen_paths or not path.exists():
+            return
+        try:
+            network_frames.append(pd.read_csv(path))
+            seen_paths.add(resolved)
+        except pd.errors.EmptyDataError:
+            return
+
+    if config.network_file is not None:
+        if config.network_file.exists():
+            _append_from_file(config.network_file)
+        else:
+            warnings.warn(
+                f"Specified network file {config.network_file} does not exist; falling back to directory scan.",
+                RuntimeWarning,
+            )
+
+    if config.raw_root.exists():
+        for pattern in ("**/*Network*.csv", "**/*network*.csv"):
+            for file in sorted(config.raw_root.glob(pattern)):
+                _append_from_file(file)
+            if network_frames:
+                break
     if not network_frames:
         return pd.DataFrame(columns=["src", "dst", "protocol"])
     df = pd.concat(network_frames, ignore_index=True)
