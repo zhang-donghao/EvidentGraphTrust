@@ -39,7 +39,10 @@
 ## 2. TON_IoT 数据集
 
 1. **下载与解析**
-   - 从 [UNSW 官网](https://research.unsw.edu.au/projects/toniot-datasets) 下载 `IIoT/Telemetry`、`Network Traffic` CSV。
+   - 从 [UNSW 官网](https://research.unsw.edu.au/projects/toniot-datasets) 下载以下官方 CSV 压缩包，并解压到同一目录：
+     - `Train_Test_IoT_Telemetry.zip`（IIoT/Telemetry 数据集，内含 `Train_Test_IoT_Telemetry.csv` 等传感器读数）。
+     - `Train_Test_Network.zip`（Network Traffic 数据集，内含 `Train_Test_Network.csv` 等网络流量统计）。
+     - 可选：若需结合系统日志，可额外下载 `Train_Test_Windows.zip`、`Train_Test_Linux.zip` 等日志 CSV，脚本会自动忽略无法识别的字段。
    - 统一时间戳并按设备 ID 分组。
 
 2. **节点与边**

@@ -61,7 +61,7 @@ EGT 基于 Evidential GNN 框架，结合可信度与不确定性建模，输出
    - 构图策略：根据通信关系、空间邻近性或时间共现建立边。
    - 特征工程：标准化数值特征，编码类别属性，构建历史信誉特征。
 
-> **快速开始**：预处理脚本已经将上述流程脚本化。
+> **快速开始**：预处理脚本已经将上述流程脚本化。在运行之前，请先从 [TON_IoT 官网](https://research.unsw.edu.au/projects/toniot-datasets) 下载 `Train_Test_IoT_Telemetry.zip` 与 `Train_Test_Network.zip`（如需日志特征可追加 `Train_Test_Windows.zip`/`Train_Test_Linux.zip`），并解压到同一目录，供预处理脚本读取。
 > ```bash
 > # 1. 处理 VeReMi 车联网数据
 > python scripts/preprocess_veremi.py --raw-root /path/to/VeReMi_csv --output-root data
