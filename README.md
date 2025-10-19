@@ -73,6 +73,9 @@ EGT 基于 Evidential GNN 框架，结合可信度与不确定性建模，输出
 > python src/train.py --dataset-root data --dataset-name veremi --epochs 100
 > python src/train.py --dataset-root data --dataset-name toni_iot --epochs 100
 > ```
+> 若某一划分（例如 TON_IoT 的验证/测试集）因窗口数量过少而为空，训练脚本会打印
+> `n/a (empty split)` 并跳过该划分的评估。可通过减小 `--window-size` 或 `--stride`
+> 生成更多窗口，从而获得完整的验证/测试指标。
 > 每个脚本会在 `data/<dataset>/processed/` 目录下生成 `train/val/test` 图张量以及 `summary.json`，供后续训练与评估直接使用。
 
 2. **建模与训练**

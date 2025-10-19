@@ -69,7 +69,13 @@ def evaluate(model: EvidentialGraphTrustNetwork, loader: DataLoader, device: tor
     metrics = []
     dataset_size = len(loader.dataset)
     if dataset_size == 0:
-        return {"loss": float("nan")}
+        return {
+            "loss": float("nan"),
+            "ece": float("nan"),
+            "brier": float("nan"),
+            "skipped": True,
+            "reason": "No graphs available for this split.",
+        }
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
@@ -111,19 +117,31 @@ def main() -> None:
         train_loss = train_epoch(model, train_loader, optimizer, device)
         val_metrics = evaluate(model, val_loader, device)
         val_loss = val_metrics.get("loss", float("inf"))
+        if val_metrics.get("skipped"):
+            val_loss_display = "n/a (empty split)"
+            val_ece_display = "n/a"
+            val_brier_display = "n/a"
+            val_loss = float("inf")
+        else:
+            val_loss_display = f"{val_loss:.4f}"
+            val_ece_display = f"{val_metrics.get('ece', float('nan')):.4f}"
+            val_brier_display = f"{val_metrics.get('brier', float('nan')):.4f}"
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_state = model.state_dict()
         print(
-            f"Epoch {epoch:03d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-            f"Val ECE: {val_metrics.get('ece', float('nan')):.4f} | Val Brier: {val_metrics.get('brier', float('nan')):.4f}"
+            f"Epoch {epoch:03d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss_display} | "
+            f"Val ECE: {val_ece_display} | Val Brier: {val_brier_display}"
         )
 
     if best_state is not None:
         model.load_state_dict(best_state)
 
     test_metrics = evaluate(model, test_loader, device)
-    print("Test metrics:", test_metrics)
+    if test_metrics.get("skipped"):
+        print("Test metrics skipped: no graphs available for evaluation.")
+    else:
+        print("Test metrics:", test_metrics)
 
 
 if __name__ == "__main__":
