@@ -97,11 +97,11 @@ def main() -> None:
             if isinstance(summary.get(name), dict) and summary[name].get("num_graphs", 0) == 0
         ]
         if empty:
-            print(
-                "Warning: split(s) "
+            raise RuntimeError(
+                "Dataset split(s) "
                 + ", ".join(sorted(empty))
-                + " have zero graphs. Training will synthesise holdout graphs from the train split; "
-                "re-run preprocessing with more windows for stable metrics."
+                + " contain zero graphs according to processed/summary.json. Regenerate the dataset with "
+                "scripts/preprocess_toniot.py (tune --window-size/--stride/--min-nodes) before running batch experiments."
             )
 
     base_cmd = [

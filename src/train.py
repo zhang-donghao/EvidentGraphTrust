@@ -60,39 +60,27 @@ def load_splits(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader, DataL
     val_ds = load_dataset(DataModuleConfig(args.dataset_root, args.dataset_name, split="val"))
     test_ds = load_dataset(DataModuleConfig(args.dataset_root, args.dataset_name, split="test"))
 
-    datasets: Dict[str, object] = {"train": train_ds, "val": val_ds, "test": test_ds}
-    synthetic_splits: List[str] = []
+    datasets: Dict[str, GraphTrustDataset] = {"train": train_ds, "val": val_ds, "test": test_ds}
 
     missing = [name for name, dataset in datasets.items() if len(dataset) == 0]
     if missing:
-        base_graphs = train_ds.to_list()
-        if not base_graphs:
-            raise RuntimeError(
-                "All dataset splits are empty; unable to synthesise holdouts. Rerun preprocessing with a smaller window, "
-                "stride, or --min-nodes setting to generate graphs before training."
-            )
-        warnings.warn(
+        raise RuntimeError(
             "Dataset split(s) "
             + ", ".join(sorted(missing))
-            + " are empty. Synthesising holdout graphs from the training split for diagnostic purposes. "
-            "Re-run preprocessing with more windows for reliable evaluation metrics."
+            + " contain zero graphs. Regenerate the dataset with scripts/preprocess_toniot.py (adjust --window-size/"
+            "--stride/--min-nodes) so that each split has at least one graph before training."
         )
-        target_size = max(1, len(base_graphs))
-        for name in missing:
-            synthetic = [base_graphs[idx % len(base_graphs)].clone() for idx in range(target_size)]
-            datasets[name] = synthetic
-            synthetic_splits.append(name)
 
     metadata = {
         "num_node_features": train_ds.num_node_features,
         "num_classes": train_ds.num_classes,
-        "synthetic_splits": synthetic_splits,
+        "synthetic_splits": [],
     }
 
     return (
-        DataLoader(datasets["train"], batch_size=1, shuffle=True),
-        DataLoader(datasets["val"], batch_size=1, shuffle=False),
-        DataLoader(datasets["test"], batch_size=1, shuffle=False),
+        DataLoader(train_ds, batch_size=1, shuffle=True),
+        DataLoader(val_ds, batch_size=1, shuffle=False),
+        DataLoader(test_ds, batch_size=1, shuffle=False),
         metadata,
     )
 
