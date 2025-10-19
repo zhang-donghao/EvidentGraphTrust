@@ -56,6 +56,34 @@ EGT 基于 Evidential GNN 框架，结合可信度与不确定性建模，输出
 
 ## 实验流程
 
+## 运行对比实验与消融实验
+
+预处理完成后，可使用批量脚本一键触发对比实验与消融实验。脚本会串行调用 ``src/train.py`` 保存每次运行的配置、指标以及可靠性曲线可视化。
+```bash
+# 对 TON_IoT 运行默认的 5 个对比模型 + 3 个消融变体
+python scripts/run_experiments.py \
+  --dataset-root data \
+  --dataset-name toni_iot \
+  --epochs 100
+```
+运行结束后，可在 ``runs/toni_iot/`` 目录下找到以下内容：
+- ``<experiment>_seed<seed>/config.json``：本次实验的所有训练参数；
+- ``.../val_metrics.json`` 与 ``.../test_metrics.json``：包含 Accuracy、F1、ROC-AUC、ECE、Brier 等主指标；
+- ``.../history.json``：每个 epoch 的训练/验证损失，用于绘制收敛曲线；
+- ``.../reliability.png``：基于测试集输出的置信度-准确率可靠性图；
+- ``summary.json``：汇总所有实验与随机种子结果，可直接导入 pandas/Excel 做对比分析。
+
+若只想运行单个模型或手动指定消融设置，可直接调用 ``src/train.py``：
+```bash
+# 运行 GCN 基线
+python src/train.py --dataset-root data --dataset-name toni_iot --model gcn --epochs 100
+
+# 运行 无证据正则 消融
+python src/train.py --dataset-root data --dataset-name toni_iot --model egtn --disable-evidence-regularizer
+```
+
+所有可视化与统计结果均保存在 ``runs/<dataset>/<run_name>/``，论文撰写时可直接引用可靠性图、指标 JSON 或进一步在 notebook 中加载 ``summary.json`` 生成对比表格。
+
 1. **数据预处理**
    - 下载公开数据集，解析原始记录，构建时序窗口。
    - 构图策略：根据通信关系、空间邻近性或时间共现建立边。

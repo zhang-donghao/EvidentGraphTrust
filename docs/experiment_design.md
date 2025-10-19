@@ -94,3 +94,20 @@
 - **不确定性可视化**：可靠性图、置信度直方图、案例分析。
 - **讨论**：结合场景解释 EGT 如何提升信任建模的可靠性，指出局限与未来工作。
 
+
+
+## 8. 实验自动化脚本
+
+使用 ``scripts/run_experiments.py`` 可以批量运行第 2 节列出的模型与第 3 节的消融组合：
+```bash
+python scripts/run_experiments.py \ 
+  --dataset-root data \ 
+  --dataset-name toni_iot \ 
+  --epochs 100
+```
+脚本会在 ``runs/<dataset>/`` 下为每次实验创建文件夹，并生成：
+- ``history.json``：记录训练/验证损失曲线，便于复现论文中的收敛图；
+- ``test_metrics.json``：包含 Accuracy、F1、ROC-AUC、ECE、Brier 等指标；
+- ``reliability.png``：可靠性图，可直接用于论文可视化；
+- ``summary.json``：整合所有实验与随机种子的结果，方便在 notebook/Excel 中做对比统计。
+如需单独运行某个模型，可调用 ``src/train.py`` 并使用 ``--model``/``--disable-evidence-regularizer`` 等参数覆盖默认设置。
