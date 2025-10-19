@@ -20,6 +20,23 @@ from tqdm import tqdm
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _graph_label(graph: Data) -> int:
+    """Return 1 if the graph contains any attacked/positive nodes, else 0."""
+    if getattr(graph, "y", None) is None:
+        return 0
+    label_tensor = graph.y
+    if hasattr(label_tensor, "view"):
+        label_tensor = label_tensor.view(-1)
+    return int(float(label_tensor.sum().item()) > 0.0)
+
+
+def _label_counts(graphs: Sequence[Data]) -> Dict[int, int]:
+    counts = {0: 0, 1: 0}
+    for graph in graphs:
+        counts[_graph_label(graph)] += 1
+    return counts
+
+
 TELEMETRY_COLUMN_ALIASES: Dict[str, Sequence[str]] = {
     "timestamp": ("ts", "timestamp", "time", "date"),
     "device_id": ("device", "device_id", "source_id", "node_id"),
@@ -595,7 +612,7 @@ def _safe_split(indices: np.ndarray, labels: np.ndarray, test_size: float, seed:
 
 def _split_graphs(graphs: List[Data], seed: int) -> Tuple[Dict[str, List[Data]], Dict[str, object]]:
     indices = np.arange(len(graphs))
-    graph_labels = np.array([int(data.y.sum().item() > 0) for data in graphs])
+    graph_labels = np.array([_graph_label(data) for data in graphs])
     train_idx, temp_idx = _safe_split(indices, graph_labels, test_size=0.3, seed=seed)
     temp_labels = graph_labels[temp_idx]
     val_idx, test_idx = _safe_split(temp_idx, temp_labels, test_size=0.5, seed=seed)
@@ -634,6 +651,63 @@ def _split_graphs(graphs: List[Data], seed: int) -> Tuple[Dict[str, List[Data]],
             diagnostics["total_graphs"] = len(graphs)
         elif redistribution_log:
             diagnostics["redistribution"] = redistribution_log
+
+    total_label_counts = _label_counts(graphs)
+
+    def _counts_for_split(name: str) -> Dict[int, int]:
+        return _label_counts(split.get(name, []))
+
+    split_label_counts = {name: _counts_for_split(name) for name in split}
+    required_labels = [label for label, count in total_label_counts.items() if count > 0]
+    priority = [name for name in ("train", "val", "test") if name in split]
+    priority_index = {name: idx for idx, name in enumerate(priority)}
+    class_moves: List[Tuple[str, str, int]] = []
+    unresolved: List[Dict[str, int]] = []
+
+    for label in required_labels:
+        for target in priority:
+            if not split[target]:
+                continue
+            if split_label_counts[target][label] > 0:
+                continue
+            donors = sorted(
+                [
+                    name
+                    for name in split
+                    if name != target and split_label_counts[name][label] > 0 and len(split[name]) > 1
+                ],
+                key=lambda name: (split_label_counts[name][label], len(split[name])),
+                reverse=True,
+            )
+            moved = False
+            for donor in donors:
+                donor_priority = priority_index.get(donor, len(priority))
+                target_priority = priority_index.get(target, len(priority))
+                if donor_priority <= target_priority and split_label_counts[donor][label] <= 1:
+                    continue
+                for idx, graph in enumerate(split[donor]):
+                    if _graph_label(graph) == label:
+                        split[target].append(split[donor].pop(idx))
+                        split_label_counts[target][label] += 1
+                        split_label_counts[donor][label] -= 1
+                        class_moves.append((donor, target, int(label)))
+                        moved = True
+                        break
+                if moved:
+                    break
+            if not moved:
+                unresolved.append({"split": target, "label": int(label)})
+
+    if class_moves:
+        diagnostics["class_redistribution"] = class_moves
+    if unresolved:
+        diagnostics["unresolved_class_gaps"] = unresolved
+
+    final_counts = {name: _label_counts(items) for name, items in split.items()}
+    diagnostics["label_distribution"] = {
+        name: {"neg": counts[0], "pos": counts[1]} for name, counts in final_counts.items()
+    }
+    diagnostics["total_label_counts"] = {"neg": total_label_counts[0], "pos": total_label_counts[1]}
 
     return split, diagnostics
 
@@ -757,3 +831,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

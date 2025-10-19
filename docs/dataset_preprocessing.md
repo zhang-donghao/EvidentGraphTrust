@@ -68,6 +68,9 @@
   - 当窗口数量极少导致验证/测试集为空时，脚本会自动缩短窗口/步幅或退化为按行切分；若所有尝试均失败，
     `diagnostics.window_search_attempts` 会说明已尝试的组合，`diagnostics.empty_splits` 列出仍为空的划分，此时需手动调整
     `--window-size`、`--stride` 或放宽 `--min-nodes` 生成更多窗口后再训练。
+  - 预处理流程还会在可能的情况下确保训练/验证/测试划分同时包含正负样本：若需要移动窗口以补足类别，
+    `diagnostics.class_redistribution` 会记录来源与目标划分；若原始数据无法提供缺失类别，则
+    `diagnostics.unresolved_class_gaps` 会提示需要缩小窗口或补充数据。
   - 确保每类攻击在测试集中出现。
 
 5. **图存储**

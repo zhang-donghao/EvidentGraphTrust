@@ -105,6 +105,9 @@ python src/train.py --dataset-root data --dataset-name toni_iot --model egtn --d
 > 会逐步缩小窗口、启用按行切分的退化策略，确保以真实窗口生成至少 3 个图样本后再写入。
 > 自动调参的最终结果与尝试过的参数会写入 `summary.json` 的
 > `diagnostics.applied_window` 与 `diagnostics.window_search_attempts` 字段。
+> 同时脚本会尽量保证训练/验证/测试划分都包含正负样本，必要时会在 `diagnostics.class_redistribution`
+> 中记录图样本的转移情况；若原始窗口不足以覆盖某个类别，则会在 `diagnostics.unresolved_class_gaps`
+> 中给出提示，需通过减小窗口或放宽 `--min-nodes` 重新生成数据。
 > 若原始 CSV 缺乏足够的有效样本导致所有尝试均失败，脚本会抛出详细错误并提示
 > 调整 `--window-size`、`--stride` 或 `--min-nodes`，此时需补充数据或放宽阈值后重新运行。
 

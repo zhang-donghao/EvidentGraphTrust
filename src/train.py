@@ -207,21 +207,27 @@ def evaluate(
     metrics["accuracy"] = accuracy_score(labels.numpy(), preds.numpy())
     metrics["f1"] = f1_score(labels.numpy(), preds.numpy(), average="macro", zero_division=0)
 
-    try:
-        if probs.size(-1) == 2:
-            pos_probs = probs[:, 1].numpy()
-            metrics["roc_auc"] = roc_auc_score(labels.numpy(), pos_probs)
-            metrics["pr_auc"] = average_precision_score(labels.numpy(), pos_probs)
-        else:
-            metrics["roc_auc"] = roc_auc_score(labels.numpy(), probs.numpy(), multi_class="ovr", average="macro")
-            metrics["pr_auc"] = average_precision_score(
-                torch.nn.functional.one_hot(labels, probs.size(-1)).numpy(),
-                probs.numpy(),
-                average="macro",
-            )
-    except ValueError:
-        metrics["roc_auc"] = float("nan")
-        metrics["pr_auc"] = float("nan")
+    metrics["roc_auc"] = float("nan")
+    metrics["pr_auc"] = float("nan")
+    unique_labels = np.unique(labels.numpy())
+    if unique_labels.size > 1:
+        try:
+            if probs.size(-1) == 2:
+                pos_probs = probs[:, 1].numpy()
+                metrics["roc_auc"] = roc_auc_score(labels.numpy(), pos_probs)
+                metrics["pr_auc"] = average_precision_score(labels.numpy(), pos_probs)
+            else:
+                metrics["roc_auc"] = roc_auc_score(
+                    labels.numpy(), probs.numpy(), multi_class="ovr", average="macro"
+                )
+                metrics["pr_auc"] = average_precision_score(
+                    torch.nn.functional.one_hot(labels, probs.size(-1)).numpy(),
+                    probs.numpy(),
+                    average="macro",
+                )
+        except ValueError:
+            metrics["roc_auc"] = float("nan")
+            metrics["pr_auc"] = float("nan")
 
     metrics["skipped"] = False
     metrics["details"] = {
