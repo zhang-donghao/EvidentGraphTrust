@@ -566,20 +566,69 @@ def _safe_split(indices: np.ndarray, labels: np.ndarray, test_size: float, seed:
     return np.array(first, dtype=int), np.array(second, dtype=int)
 
 
-def _split_graphs(graphs: List[Data], seed: int) -> Dict[str, List[Data]]:
+def _split_graphs(graphs: List[Data], seed: int) -> Tuple[Dict[str, List[Data]], Dict[str, object]]:
     indices = np.arange(len(graphs))
     graph_labels = np.array([int(data.y.sum().item() > 0) for data in graphs])
     train_idx, temp_idx = _safe_split(indices, graph_labels, test_size=0.3, seed=seed)
     temp_labels = graph_labels[temp_idx]
     val_idx, test_idx = _safe_split(temp_idx, temp_labels, test_size=0.5, seed=seed)
-    return {
+    split: Dict[str, List[Data]] = {
         "train": [graphs[i] for i in train_idx],
         "val": [graphs[i] for i in val_idx],
         "test": [graphs[i] for i in test_idx],
     }
 
+    diagnostics: Dict[str, object] = {"synthetic_duplicates": []}
 
-def _save_split(split: Dict[str, List[Data]], metadata: Dict[str, object], output_root: Path) -> None:
+    if not graphs:
+        return split, diagnostics
+
+    rng = np.random.default_rng(seed)
+
+    def _duplicate_graph(source_split: str, target_split: str) -> None:
+        source_graphs = split.get(source_split, [])
+        if not source_graphs:
+            return
+        template = source_graphs[rng.integers(0, len(source_graphs))]
+        cloned = template.clone()
+        cloned.synthetic_duplicate = True  # type: ignore[attr-defined]
+        cloned.synthetic_source = source_split  # type: ignore[attr-defined]
+        split[target_split].append(cloned)
+        diagnostics["synthetic_duplicates"].append(
+            {
+                "target_split": target_split,
+                "source_split": source_split,
+                "original_window_start": getattr(template, "window_start", None),
+                "original_window_end": getattr(template, "window_end", None),
+            }
+        )
+
+    # Ensure every split has at least one graph when any graphs exist.
+    for name in ("val", "test"):
+        if split[name]:
+            continue
+        # Prefer duplicating from train, otherwise fall back to the other non-empty split.
+        if split["train"]:
+            _duplicate_graph("train", name)
+        else:
+            fallback = "val" if name == "test" else "test"
+            if split[fallback]:
+                _duplicate_graph(fallback, name)
+
+    # In the degenerate case of a single graph where train ended empty, seed the train split as well.
+    if not split["train"] and (split["val"] or split["test"]):
+        source = "val" if split["val"] else "test"
+        _duplicate_graph(source, "train")
+
+    return split, diagnostics
+
+
+def _save_split(
+    split: Dict[str, List[Data]],
+    metadata: Dict[str, object],
+    output_root: Path,
+    diagnostics: Optional[Dict[str, object]] = None,
+) -> None:
     processed_dir = output_root / "processed"
     processed_dir.mkdir(parents=True, exist_ok=True)
     for name, graphs in split.items():
@@ -589,9 +638,14 @@ def _save_split(split: Dict[str, List[Data]], metadata: Dict[str, object], outpu
             "num_graphs": len(graphs),
             "avg_nodes": float(np.mean([g.num_nodes for g in graphs])) if graphs else 0.0,
             "attack_ratio": float(np.mean([g.y.float().mean().item() for g in graphs])) if graphs else 0.0,
+            "synthetic_graphs": int(
+                sum(1 for g in graphs if getattr(g, "synthetic_duplicate", False))
+            ),
         }
         for name, graphs in split.items()
     }
+    if diagnostics and diagnostics.get("synthetic_duplicates"):
+        summary["diagnostics"] = diagnostics
     with open(processed_dir / "summary.json", "w", encoding="utf-8") as fp:
         json.dump(summary, fp, indent=2)
 
@@ -604,9 +658,9 @@ def main() -> None:
         graphs, metadata = _extract_graphs_from_network(network_df, config)
     else:
         graphs, metadata = _extract_graphs_from_telemetry(telemetry_df, network_df, config)
-    split = _split_graphs(graphs, config.seed)
+    split, diagnostics = _split_graphs(graphs, config.seed)
     dataset_root = config.output_root / "toni_iot"
-    _save_split(split, metadata, dataset_root)
+    _save_split(split, metadata, dataset_root, diagnostics)
     print(f"Saved TON_IoT graphs to {dataset_root / 'processed'}")
 
 

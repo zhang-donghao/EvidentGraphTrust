@@ -78,7 +78,7 @@ EGT 基于 Evidential GNN 框架，结合可信度与不确定性建模，输出
 > 应指标。当总窗口数不足 3 个时，脚本会复制现有窗口以合成验证/测试集，同时打印
 > 警告提示这只是诊断用途，建议通过减小 `--window-size` 或 `--stride` 生成更多窗口后
 > 再次运行预处理，以获得稳定的评估结果。
-> 每个脚本会在 `data/<dataset>/processed/` 目录下生成 `train/val/test` 图张量以及 `summary.json`，供后续训练与评估直接使用。
+> 每个脚本会在 `data/<dataset>/processed/` 目录下生成 `train/val/test` 图张量以及 `summary.json`，记录每个划分的图数量、平均节点数、攻击占比，并新增 `synthetic_graphs` 与 `diagnostics` 字段，在触发自动复制窗口时标注来源，方便后续排查。
 
 2. **建模与训练**
    - 使用 PyTorch Geometric 构建模型，支持多 GPU/多进程训练。
