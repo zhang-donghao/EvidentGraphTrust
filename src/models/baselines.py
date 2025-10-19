@@ -1,6 +1,7 @@
 """Baseline graph classifiers for comparison experiments."""
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Dict, Optional, Type
 
@@ -34,6 +35,7 @@ class _GraphStack(nn.Module):
         super().__init__()
         layers = nn.ModuleList()
         in_dim = config.input_dim
+        supports_edge_weight = []
         for _ in range(config.num_layers):
             if gat:
                 layer = conv_cls(
@@ -47,19 +49,24 @@ class _GraphStack(nn.Module):
                 layer = conv_cls(in_dim, config.hidden_dim)
                 in_dim = config.hidden_dim
             layers.append(layer)
+            signature = inspect.signature(layer.forward)
+            supports_edge_weight.append("edge_weight" in signature.parameters)
         self.layers = layers
         self.activation = nn.ReLU()
         self.dropout = nn.Dropout(config.dropout)
+        self._supports_edge_weight = supports_edge_weight
 
     def forward(
         self, x: torch.Tensor, edge_index: torch.Tensor, edge_weight: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         h = x
-        for layer in self.layers:
+        for layer, supports_edge_weight in zip(self.layers, self._supports_edge_weight):
             if isinstance(layer, GATConv):
                 h = layer(h, edge_index)
-            else:
+            elif supports_edge_weight and edge_weight is not None:
                 h = layer(h, edge_index, edge_weight)
+            else:
+                h = layer(h, edge_index)
             h = self.activation(h)
             h = self.dropout(h)
         return h
