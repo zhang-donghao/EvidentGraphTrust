@@ -47,9 +47,9 @@
      - 可选：若需结合系统日志，可额外下载 `Train_Test_Windows.zip`、`Train_Test_Linux.zip` 等日志 CSV，脚本会自动忽略无法识别的字段。
    - 若暂时只具备 `Train_Test_Network.csv`，可直接将该文件（或重命名后的 `train_test_network.csv`）放到仓库的 `src/data/` 目录；`preprocess_toniot.py` 会自动检测该文件并进入“网络流量特征”回退路径：以 `src`/`dst` 设备 ID 构建节点，统计出入度、端口与字节类数值字段的窗口统计量，并根据网络日志标签推断节点是否受攻。示例命令：
 
-     ```bash
-     python scripts/preprocess_toniot.py --output-root data
-     ```
+    ```bash
+    python scripts/preprocess_toniot.py --output-root data --min-split-graphs 20
+    ```
    - 统一时间戳并按设备 ID 分组。
 
 2. **节点与边**
@@ -65,12 +65,13 @@
 4. **标签与划分**
    - 标签来自提供的攻击标记；
   - 训练/验证：选取 70% 设备；测试：剩余 30% 未见设备；
-  - 当窗口数量极少导致验证/测试集为空时，脚本会自动缩短窗口/步幅或退化为按行切分；若所有尝试均失败，
-    `diagnostics.window_search_attempts` 会说明已尝试的组合，`diagnostics.empty_splits` 列出仍为空的划分，此时需手动调整
-    `--window-size`、`--stride` 或放宽 `--min-nodes` 生成更多窗口后再训练。
+  - 当窗口数量极少导致验证/测试集为空或不足以达到 `--min-split-graphs`（默认 10，可按需提高至 20 以上）时，
+    脚本会自动缩短窗口、减小步幅并在必要时降低 `--min-nodes`，直至所有划分满足阈值。
+    若所有组合均失败，`diagnostics.window_search_attempts` 会列出尝试过的参数与失败原因（例如 `reason: split_too_small`），
+    此时需继续缩小窗口、降低 `--min-nodes` 或补充数据后重试。
   - 预处理流程还会在可能的情况下确保训练/验证/测试划分同时包含正负样本：若需要移动窗口以补足类别，
     `diagnostics.class_redistribution` 会记录来源与目标划分；若原始数据无法提供缺失类别，则
-    `diagnostics.unresolved_class_gaps` 会提示需要缩小窗口或补充数据。
+    `diagnostics.unresolved_class_gaps` 会提示需要缩小窗口或补充数据，以免后续评估出现 ROC-AUC 未定义等问题。
   - 确保每类攻击在测试集中出现。
 
 5. **图存储**
@@ -94,7 +95,7 @@
 
 ```bash
 python scripts/preprocess_veremi.py --raw-root /data/VeReMi_csv --output-root data
-python scripts/preprocess_toniot.py --output-root data  # 默认检测 src/data/train_test_network.csv
+python scripts/preprocess_toniot.py --output-root data --min-split-graphs 20  # 默认检测 src/data/train_test_network.csv
 
 # 训练证据图神经网络
 python src/train.py --dataset-root data --dataset-name veremi --epochs 100

@@ -95,21 +95,22 @@ python src/train.py --dataset-root data --dataset-name toni_iot --model egtn --d
 > python scripts/preprocess_veremi.py --raw-root /path/to/VeReMi_csv --output-root data
 >
 > # 2. 处理 TON_IoT 物联网数据（含自动检测 src/data/train_test_network.csv 的回退逻辑）
-> python scripts/preprocess_toniot.py --output-root data
+> python scripts/preprocess_toniot.py --output-root data --min-split-graphs 20
 >
 > # 3. 训练证据图网络（示例）
 > python src/train.py --dataset-root data --dataset-name veremi --epochs 100
 > python src/train.py --dataset-root data --dataset-name toni_iot --epochs 100
 > ```
-> 预处理脚本会自动尝试多组窗口长度/步幅组合，优先使用默认参数；若验证/测试划分为空，
-> 会逐步缩小窗口、启用按行切分的退化策略，确保以真实窗口生成至少 3 个图样本后再写入。
-> 自动调参的最终结果与尝试过的参数会写入 `summary.json` 的
-> `diagnostics.applied_window` 与 `diagnostics.window_search_attempts` 字段。
-> 同时脚本会尽量保证训练/验证/测试划分都包含正负样本，必要时会在 `diagnostics.class_redistribution`
-> 中记录图样本的转移情况；若原始窗口不足以覆盖某个类别，则会在 `diagnostics.unresolved_class_gaps`
-> 中给出提示，需通过减小窗口或放宽 `--min-nodes` 重新生成数据。
-> 若原始 CSV 缺乏足够的有效样本导致所有尝试均失败，脚本会抛出详细错误并提示
-> 调整 `--window-size`、`--stride` 或 `--min-nodes`，此时需补充数据或放宽阈值后重新运行。
+> 预处理脚本会在默认窗口/步幅的基础上自动搜索更细的窗口与更密的滑动步长，并在必要时降低
+> `--min-nodes`，直到训练 / 验证 / 测试划分都至少包含 `--min-split-graphs` 个真实窗口（默认 10，可手动
+> 提高到 20+ 以获得更稳定的评估）。若搜索过程中出现空划分或类别缺失，脚本会继续尝试下一组参
+> 数；所有尝试及失败原因会记录在 `summary.json` 的 `diagnostics.window_search_attempts` 字段中。
+> 成功写入的数据会在 `diagnostics.applied_window` 中标注最终窗口、步幅、`min_nodes` 与
+> `min_split_graphs`，并在 `diagnostics.label_distribution` 与
+> `diagnostics.class_redistribution` 中说明各划分的正负样本数量与必要的样本转移。如果原始窗口仍无法
+> 覆盖某个类别，`diagnostics.unresolved_class_gaps` 会给出提示，此时需进一步减小窗口、降低
+> `--min-nodes` 或补充数据源。若所有组合都不足以满足阈值，脚本会抛出详细错误并指示需要调整的参
+> 数。
 
 2. **建模与训练**
    - 使用 PyTorch Geometric 构建模型，支持多 GPU/多进程训练。

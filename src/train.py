@@ -114,7 +114,7 @@ def create_model(args: argparse.Namespace, metadata: Dict[str, int]) -> Tuple[nn
             num_layers=args.num_layers,
             dropout=args.dropout,
             heads=args.heads,
-            dirichlet_strength=float(num_classes),
+            dirichlet_strength=1.0,
         )
         model = build_baseline(args.model, config)
         evidential = False

@@ -78,6 +78,7 @@ class TONTConfig:
     window_size: float = 300.0
     stride: float = 120.0
     min_nodes: int = 4
+    min_split_graphs: int = 10
     seed: int = 42
     network_file: Optional[Path] = None
 
@@ -95,6 +96,15 @@ def parse_args() -> TONTConfig:
     parser.add_argument("--window-size", type=float, default=300.0, help="Window length (seconds) for telemetry aggregation")
     parser.add_argument("--stride", type=float, default=120.0, help="Sliding window stride in seconds")
     parser.add_argument("--min-nodes", type=int, default=4, help="Minimum number of devices per graph")
+    parser.add_argument(
+        "--min-split-graphs",
+        type=int,
+        default=10,
+        help=(
+            "Minimum number of graphs required in each split. The preprocessor will automatically "
+            "search for smaller windows/strides until this threshold is met."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for data splits")
     parser.add_argument(
         "--network-file",
@@ -138,6 +148,7 @@ def parse_args() -> TONTConfig:
         stride=args.stride,
         min_nodes=args.min_nodes,
         seed=args.seed,
+        min_split_graphs=max(1, args.min_split_graphs),
         network_file=network_file,
     )
 
@@ -713,18 +724,22 @@ def _split_graphs(graphs: List[Data], seed: int) -> Tuple[Dict[str, List[Data]],
 
 
 def _candidate_configs(config: TONTConfig) -> Iterable[TONTConfig]:
-    scales = [1.0, 0.5, 0.25, 0.125]
-    seen: set[Tuple[float, float]] = set()
-    for scale in scales:
-        window = max(30.0, float(config.window_size * scale))
-        stride = max(10.0, float(config.stride * scale))
-        if stride > window:
-            stride = window
-        key = (round(window, 4), round(stride, 4))
-        if key in seen:
-            continue
-        seen.add(key)
-        yield replace(config, window_size=window, stride=stride)
+    window_scales = [1.0, 0.75, 0.5, 0.25, 0.125]
+    stride_scales = [1.0, 0.5, 0.25, 0.125]
+    min_nodes_candidates = sorted({config.min_nodes, max(2, config.min_nodes - 1), 2}, reverse=True)
+    seen: set[Tuple[int, float, float]] = set()
+    for min_nodes in min_nodes_candidates:
+        for window_scale in window_scales:
+            window = max(30.0, float(config.window_size * window_scale))
+            for stride_scale in stride_scales:
+                stride = max(10.0, float(config.stride * window_scale * stride_scale))
+                if stride > window:
+                    stride = window
+                key = (min_nodes, round(window, 4), round(stride, 4))
+                if key in seen:
+                    continue
+                seen.add(key)
+                yield replace(config, window_size=window, stride=stride, min_nodes=min_nodes)
 
 
 def _generate_graphs_with_split(
@@ -755,15 +770,38 @@ def _generate_graphs_with_split(
             "window_size": candidate.window_size,
             "stride": candidate.stride,
             "num_graphs": len(graphs),
+            "min_nodes": candidate.min_nodes,
         }
         if len(graphs) < 3:
             summary["reason"] = "insufficient_graphs"
             attempts.append(summary)
             continue
         split, diagnostics = _split_graphs(graphs, candidate.seed)
+        split_sizes = {name: len(items) for name, items in split.items()}
+        summary["split_sizes"] = split_sizes
         empty_splits = diagnostics.get("empty_splits")
         if empty_splits:
             summary["empty_splits"] = empty_splits
+            attempts.append(summary)
+            continue
+        min_split = min(split_sizes.values()) if split_sizes else 0
+        if min_split < candidate.min_split_graphs:
+            summary["reason"] = "split_too_small"
+            summary["min_split_graphs"] = candidate.min_split_graphs
+            attempts.append(summary)
+            continue
+        label_dist = diagnostics.get("label_distribution", {})
+        coverage_ok = True
+        for split_name in ("val", "test"):
+            counts = label_dist.get(split_name)
+            if not counts:
+                continue
+            if counts.get("neg", 0) == 0 or counts.get("pos", 0) == 0:
+                coverage_ok = False
+                break
+        if not coverage_ok:
+            summary["reason"] = "class_gap"
+            summary["label_distribution"] = label_dist
             attempts.append(summary)
             continue
         return graphs, metadata, split, diagnostics, candidate, attempts
@@ -820,6 +858,8 @@ def main() -> None:
         {
             "window_size": applied_config.window_size,
             "stride": applied_config.stride,
+            "min_nodes": applied_config.min_nodes,
+            "min_split_graphs": applied_config.min_split_graphs,
         }
     )
     if attempts:

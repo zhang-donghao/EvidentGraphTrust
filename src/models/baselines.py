@@ -7,6 +7,7 @@ from typing import Dict, Optional, Type
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch_geometric.nn import GATConv, GCNConv, SAGEConv
 
 
@@ -20,7 +21,7 @@ class BaselineConfig:
     num_layers: int = 2
     dropout: float = 0.3
     heads: int = 4
-    dirichlet_strength: float = 2.0
+    dirichlet_strength: float = 1.0
 
 
 class _GraphStack(nn.Module):
@@ -86,8 +87,7 @@ class GCNClassifier(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         h = self.backbone(x, edge_index, edge_weight)
         logits = self.head(h)
-        probs = torch.softmax(logits, dim=-1)
-        alpha = probs * self.dirichlet_strength + 1.0
+        alpha = F.softplus(logits) + self.dirichlet_strength
         return {"logits": logits, "alpha": alpha}
 
 
@@ -103,8 +103,7 @@ class GATClassifier(nn.Module):
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor, _: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         h = self.backbone(x, edge_index)
         logits = self.head(h)
-        probs = torch.softmax(logits, dim=-1)
-        alpha = probs * self.dirichlet_strength + 1.0
+        alpha = F.softplus(logits) + self.dirichlet_strength
         return {"logits": logits, "alpha": alpha}
 
 
@@ -122,8 +121,7 @@ class GraphSAGEClassifier(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         h = self.backbone(x, edge_index, edge_weight)
         logits = self.head(h)
-        probs = torch.softmax(logits, dim=-1)
-        alpha = probs * self.dirichlet_strength + 1.0
+        alpha = F.softplus(logits) + self.dirichlet_strength
         return {"logits": logits, "alpha": alpha}
 
 
@@ -146,8 +144,7 @@ class MLPClassifier(nn.Module):
     def forward(self, x: torch.Tensor, _: torch.Tensor, __: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         h = self.encoder(x)
         logits = self.head(h)
-        probs = torch.softmax(logits, dim=-1)
-        alpha = probs * self.dirichlet_strength + 1.0
+        alpha = F.softplus(logits) + self.dirichlet_strength
         return {"logits": logits, "alpha": alpha}
 
 
