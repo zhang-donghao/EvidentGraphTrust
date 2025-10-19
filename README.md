@@ -89,31 +89,27 @@ python src/train.py --dataset-root data --dataset-name toni_iot --model egtn --d
    - 构图策略：根据通信关系、空间邻近性或时间共现建立边。
    - 特征工程：标准化数值特征，编码类别属性，构建历史信誉特征。
 
-> **快速开始**：预处理脚本已经将上述流程脚本化。在运行之前，推荐从 [TON_IoT 官网](https://research.unsw.edu.au/projects/toniot-datasets) 下载 `Train_Test_IoT_Telemetry.zip` 与 `Train_Test_Network.zip`（如需日志特征可追加 `Train_Test_Windows.zip`/`Train_Test_Linux.zip`），并解压到同一目录，供预处理脚本读取。若暂时只有网络流量文件，可直接将 `Train_Test_Network.csv`（或重命名为 `train_test_network.csv`）放入仓库自带的 `src/data/` 目录，然后运行脚本，系统会自动检测该文件并进入“仅网络流量”模式，仍可完成图构建与训练。
+> **快速开始（TrustGuard 风格）**：我们直接复刻了 [TrustGuard 项目](https://github.com/Jieerbobo/TrustGuard) 的数据目录与预处理流程。请先将官方数据集放置在相同的目录结构中：
+> - VeReMi：将原始 CSV 解压到 `data/raw/veremi/`（保持 TrustGuard 中的文件层次）。
+> - TON_IoT：将 `Train_Test_Network.csv`（或 `train_test_network.csv`）解压到 `data/raw/ton_iot/`。
+> 然后运行下列脚本生成图数据：
 > ```bash
 > # 1. 处理 VeReMi 车联网数据
-> python scripts/preprocess_veremi.py --raw-root /path/to/VeReMi_csv --output-root data
+> python scripts/preprocess_veremi.py --raw-root data/raw/veremi --output-root data
 >
-> # 2. 处理 TON_IoT 物联网数据（含自动检测 src/data/train_test_network.csv 的回退逻辑）
+> # 2. 处理 TON_IoT 物联网数据（TrustGuard 样式的窗口聚合）
 > python scripts/preprocess_toniot.py \
+>   --raw-root data/raw/ton_iot \
 >   --output-root data \
->   --min-split-graphs 40 \
->   --min-class-per-split 20
+>   --window-size 120 \
+>   --stride 60 \
+>   --min-rows-per-window 32
 >
 > # 3. 训练证据图网络（示例）
 > python src/train.py --dataset-root data --dataset-name veremi --epochs 100
 > python src/train.py --dataset-root data --dataset-name toni_iot --epochs 100
 > ```
-> 预处理脚本会在默认窗口/步幅的基础上自动搜索更细的窗口与更密的滑动步长，并在必要时降低
-> `--min-nodes`，直到训练 / 验证 / 测试划分都至少包含 `--min-split-graphs` 个真实窗口（默认 30，可手动
-> 提高到 40+ 以获得更稳定的评估），且每个划分的正负样本都不少于 `--min-class-per-split`（默认 20）。
-> 划分按照时间顺序切分窗口并保留起止时间，确保不同 split 之间不再随机交叉。若搜索过程中出现空划
-> 分或类别缺失，脚本会继续尝试下一组参数；所有尝试及失败原因会记录在 `summary.json` 的
-> `diagnostics.window_search_attempts` 字段中。成功写入的数据会在 `diagnostics.applied_window` 中标注最终
-> 窗口、步幅、`min_nodes`、`min_split_graphs` 与 `min_class_per_split`，并在
-> `diagnostics.label_distribution` 中说明各划分的正负样本数量。如果原始窗口仍无法覆盖某个类别，脚本
-> 会抛出详细错误并指示需要进一步缩小窗口/步幅或补充原始日志；在这种情况下不会生成含有单一类别或
-> 极少样本的测试集。
+> 预处理脚本会生成与 TrustGuard 相同格式的 `processed/train_graph.pt`、`processed/val_graph.pt`、`processed/test_graph.pt` 以及摘要 `summary.json`。默认按照时间顺序切分窗口，不再进行多轮参数搜索；若当前窗口设置导致样本不足，可调整 `--window-size`、`--stride` 或 `--min-rows-per-window`。脚本会在检测到任一划分的图数量低于 `--min-graphs-per-split` 时停止，并提示需要扩大时间范围或降低阈值。
 
 2. **建模与训练**
    - 使用 PyTorch Geometric 构建模型，支持多 GPU/多进程训练。

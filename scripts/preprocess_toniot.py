@@ -1,1083 +1,644 @@
-"""Preprocess TON_IoT dataset into PyG graphs for Evident Graph Trust."""
+#!/usr/bin/env python
+"""Preprocess the TON_IoT network telemetry into TrustGuard-style graph windows.
+
+This script mirrors the data handling flow used by the TrustGuard project.  The
+original repository aggregates IoT flow records into temporal windows,
+constructs directed host graphs, and stores PyTorch Geometric ``Data`` objects
+for downstream graph neural network training.  The implementation below follows
+that recipe but keeps the model layer flexible so we can train Evidential GNNs
+on top of the processed artefacts.
+
+The CLI expects the raw ``Train_Test_Network.csv`` file (or its renamed
+counterpart ``train_test_network.csv``).  By default we look for the file inside
+``data/raw/ton_iot`` to match TrustGuard's layout, but any custom location can be
+specified via ``--raw-root`` or ``--network-file``.  The output is saved under
+``<output-root>/toni_iot/processed`` with one ``*.pt`` file per split and a
+compact ``summary.json`` mirroring TrustGuard's dataset manifest.
+"""
+
 from __future__ import annotations
 
 import argparse
 import json
-import warnings
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 import torch
+from sklearn.preprocessing import StandardScaler
 from torch_geometric.data import Data
-from tqdm import tqdm
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-
-
-def _graph_label(graph: Data) -> int:
-    """Return 1 if the graph contains any attacked/positive nodes, else 0."""
-    if getattr(graph, "y", None) is None:
-        return 0
-    label_tensor = graph.y
-    if hasattr(label_tensor, "view"):
-        label_tensor = label_tensor.view(-1)
-    return int(float(label_tensor.sum().item()) > 0.0)
-
-
-def _label_counts(graphs: Sequence[Data]) -> Dict[int, int]:
-    counts = {0: 0, 1: 0}
-    for graph in graphs:
-        counts[_graph_label(graph)] += 1
-    return counts
-
-
-TELEMETRY_COLUMN_ALIASES: Dict[str, Sequence[str]] = {
-    "timestamp": ("ts", "timestamp", "time", "date"),
-    "device_id": ("device", "device_id", "source_id", "node_id"),
-    "value": ("value", "reading", "metric", "measure"),
-}
-
-NETWORK_COLUMN_ALIASES: Dict[str, Sequence[str]] = {
-    "src": ("src_device", "src_ip", "source_id", "src"),
-    "dst": ("dst_device", "dst_ip", "destination_id", "dst"),
-    "protocol": ("protocol", "proto"),
-    "timestamp": ("ts", "timestamp", "time", "date", "datetime"),
-    "label": ("label", "attack", "target", "is_anomaly", "class"),
-}
-
-EXCLUDED_TELEMETRY_COLUMNS = {
-    "timestamp",
-    "device_id",
-    "label",
-    "attack",
-    "class",
-    "target",
-    "is_anomaly",
-    "category",
-}
-
-EXCLUDED_NETWORK_FEATURE_COLUMNS = {
-    "src",
-    "dst",
-    "protocol",
-    "timestamp",
-    "label",
-}
+# ---------------------------------------------------------------------------
+# Configuration helpers
+# ---------------------------------------------------------------------------
 
 
 @dataclass
-class TONTConfig:
+class PreprocessConfig:
     raw_root: Path
     output_root: Path
-    window_size: float = 300.0
-    stride: float = 120.0
-    min_nodes: int = 4
-    min_split_graphs: int = 30
-    min_class_per_split: int = 20
-    time_buffer: int = 0
-    seed: int = 42
-    network_file: Optional[Path] = None
+    network_file: Optional[Path]
+    window_size: float
+    stride: float
+    train_ratio: float
+    val_ratio: float
+    min_rows_per_window: int
+    min_nodes: int
+    min_graphs_per_split: int
+    random_seed: int
+
+    @property
+    def test_ratio(self) -> float:
+        return max(0.0, 1.0 - self.train_ratio - self.val_ratio)
 
 
-def parse_args() -> TONTConfig:
-    default_raw_root = REPO_ROOT / "src" / "data"
-    parser = argparse.ArgumentParser(description="Preprocess TON_IoT dataset")
+def parse_args() -> PreprocessConfig:
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--raw-root",
         type=Path,
-        default=default_raw_root,
-        help="Directory containing TON_IoT CSV files (defaults to repo src/data)",
-    )
-    parser.add_argument("--output-root", type=Path, required=True, help="Directory to store processed dataset")
-    parser.add_argument("--window-size", type=float, default=300.0, help="Window length (seconds) for telemetry aggregation")
-    parser.add_argument("--stride", type=float, default=120.0, help="Sliding window stride in seconds")
-    parser.add_argument("--min-nodes", type=int, default=4, help="Minimum number of devices per graph")
-    parser.add_argument(
-        "--min-split-graphs",
-        type=int,
-        default=30,
-        help=(
-            "Minimum number of graphs required in each split. The preprocessor will automatically "
-            "search for smaller windows/strides until this threshold is met."
-        ),
+        default=Path("data/raw/ton_iot"),
+        help="Directory containing the raw TON_IoT CSV assets (TrustGuard layout).",
     )
     parser.add_argument(
-        "--min-class-per-split",
-        type=int,
-        default=20,
-        help=(
-            "Minimum number of positive and negative graphs required in each split. "
-            "Candidates that do not satisfy this constraint are rejected."
-        ),
+        "--output-root",
+        type=Path,
+        default=Path("data"),
+        help="Root directory where processed graphs will be stored.",
     )
-    parser.add_argument(
-        "--time-buffer",
-        type=int,
-        default=0,
-        help=(
-            "Number of graphs to drop at the temporal boundaries between splits to reduce window "
-            "overlap. Set to 0 to disable temporal buffering."
-        ),
-    )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for data splits")
     parser.add_argument(
         "--network-file",
         type=Path,
         default=None,
-        help="Explicit path to Train_Test_Network.csv (defaults to <raw-root>/train_test_network.csv if present)",
+        help="Explicit path to Train_Test_Network.csv. Overrides --raw-root lookup.",
+    )
+    parser.add_argument(
+        "--window-size",
+        type=float,
+        default=120.0,
+        help="Temporal window size in seconds (row-count fallback when timestamps are missing).",
+    )
+    parser.add_argument(
+        "--stride",
+        type=float,
+        default=60.0,
+        help="Stride between windows in seconds (row-count fallback when timestamps are missing).",
+    )
+    parser.add_argument(
+        "--train-ratio",
+        type=float,
+        default=0.6,
+        help="Proportion of windows assigned to the training split.",
+    )
+    parser.add_argument(
+        "--val-ratio",
+        type=float,
+        default=0.2,
+        help="Proportion of windows assigned to the validation split (test receives the remainder).",
+    )
+    parser.add_argument(
+        "--min-rows-per-window",
+        type=int,
+        default=32,
+        help="Discard windows containing fewer records than this threshold.",
+    )
+    parser.add_argument(
+        "--min-nodes",
+        type=int,
+        default=4,
+        help="Discard graphs with fewer than this number of nodes after aggregation.",
+    )
+    parser.add_argument(
+        "--min-graphs-per-split",
+        type=int,
+        default=30,
+        help="Abort preprocessing if any split would end up with fewer graphs than this count.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed used for deterministic shuffling (applies when timestamps are absent).",
     )
     args = parser.parse_args()
-    raw_root = args.raw_root.expanduser()
-    if not raw_root.exists() and default_raw_root.exists():
-        warnings.warn(
-            f"Specified raw root {raw_root} does not exist. Falling back to {default_raw_root}.",
-            RuntimeWarning,
-        )
-        raw_root = default_raw_root
-    network_file: Optional[Path] = args.network_file
-    if network_file is None:
-        candidates = [
-            raw_root / "train_test_network.csv",
-            raw_root / "Train_Test_Network.csv",
-        ]
-        if raw_root != default_raw_root:
-            candidates.extend(
-                [
-                    default_raw_root / "train_test_network.csv",
-                    default_raw_root / "Train_Test_Network.csv",
-                ]
-            )
-        for candidate in candidates:
-            if candidate.exists():
-                network_file = candidate
-                break
-        else:
-            if raw_root.is_file() and raw_root.suffix.lower() == ".csv":
-                network_file = raw_root
-                raw_root = raw_root.parent
-    return TONTConfig(
-        raw_root=raw_root,
+
+    return PreprocessConfig(
+        raw_root=args.raw_root,
         output_root=args.output_root,
+        network_file=args.network_file,
         window_size=args.window_size,
         stride=args.stride,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        min_rows_per_window=args.min_rows_per_window,
         min_nodes=args.min_nodes,
-        seed=args.seed,
-        min_split_graphs=max(1, args.min_split_graphs),
-        min_class_per_split=max(1, args.min_class_per_split),
-        time_buffer=max(0, args.time_buffer),
-        network_file=network_file,
+        min_graphs_per_split=args.min_graphs_per_split,
+        random_seed=args.seed,
     )
 
 
-def _select_column(df: pd.DataFrame, aliases: Sequence[str], required: bool, default: Optional[str] = None) -> str:
-    for name in aliases:
-        if name in df.columns:
-            return name
-    if default is not None:
-        return default
-    if required:
-        raise KeyError(f"Missing required column. Expected one of {aliases}, got {list(df.columns)}")
-    return ""
+# ---------------------------------------------------------------------------
+# Data discovery utilities
+# ---------------------------------------------------------------------------
 
 
-def _compute_stats(values: np.ndarray) -> Tuple[float, float, float]:
-    if values.size == 0:
-        return 0.0, 0.0, 0.0
-    return float(values.mean()), float(values.std(ddof=0)), float(values.max())
-
-
-def _reduce_label_series(series: pd.Series, normal_tokens: Optional[Sequence[str]] = None) -> int:
-    values = series.dropna()
-    if values.empty:
-        return 0
-    if values.dtype == object:
-        normal = {"normal", "benign", "0", "false", "no"}
-        if normal_tokens is not None:
-            normal = set(normal_tokens)
-        lower = values.astype(str).str.lower()
-        return int(any(token not in normal for token in lower))
-    numeric = pd.to_numeric(values, errors="coerce").fillna(0)
-    return int((numeric > 0).any())
-
-
-def _load_csvs(root: Path, pattern: str) -> List[pd.DataFrame]:
-    if root.is_file():
-        try:
-            return [pd.read_csv(root)]
-        except pd.errors.EmptyDataError:
-            return []
-    if not root.exists():
-        return []
-    files = sorted(root.glob(pattern))
-    frames = []
-    for file in files:
-        try:
-            frames.append(pd.read_csv(file))
-        except pd.errors.EmptyDataError:
-            continue
-    return frames
-
-
-def _load_telemetry(config: TONTConfig) -> Optional[pd.DataFrame]:
-    telemetry_frames = _load_csvs(config.raw_root, "**/*Telemetry*.csv")
-    if not telemetry_frames:
-        telemetry_frames = _load_csvs(config.raw_root, "**/*telemetry*.csv")
-    if not telemetry_frames:
-        warnings.warn(
-            "No telemetry CSV files were found. Falling back to network-only preprocessing.",
-            RuntimeWarning,
-        )
-        return None
-    df = pd.concat(telemetry_frames, ignore_index=True)
-
-    col_map = {
-        "timestamp": _select_column(df, TELEMETRY_COLUMN_ALIASES["timestamp"], required=True),
-        "device_id": _select_column(df, TELEMETRY_COLUMN_ALIASES["device_id"], required=True),
-    }
-    df = df.rename(columns={col_map["timestamp"]: "timestamp", col_map["device_id"]: "device_id"})
-    df["timestamp"] = pd.to_datetime(df["timestamp"]).astype("int64") / 1e9
-    for metric_col in df.columns:
-        if metric_col not in EXCLUDED_TELEMETRY_COLUMNS:
-            df[metric_col] = pd.to_numeric(df[metric_col], errors="coerce")
-    df = df.dropna(subset=["device_id", "timestamp"])
-    df["device_id"] = df["device_id"].astype(str)
-    return df
-
-
-def _load_network(config: TONTConfig) -> pd.DataFrame:
-    network_frames: List[pd.DataFrame] = []
-    seen_paths = set()
-
-    def _append_from_file(path: Path) -> None:
-        try:
-            resolved = path.resolve()
-        except OSError:
-            resolved = path
-        if resolved in seen_paths or not path.exists():
-            return
-        try:
-            network_frames.append(pd.read_csv(path))
-            seen_paths.add(resolved)
-        except pd.errors.EmptyDataError:
-            return
-
+def _candidate_network_paths(config: PreprocessConfig) -> List[Path]:
     if config.network_file is not None:
-        if config.network_file.exists():
-            _append_from_file(config.network_file)
-        else:
-            warnings.warn(
-                f"Specified network file {config.network_file} does not exist; falling back to directory scan.",
-                RuntimeWarning,
-            )
+        return [config.network_file]
 
+    candidates: List[Path] = []
     if config.raw_root.exists():
-        for pattern in ("**/*Network*.csv", "**/*network*.csv"):
-            for file in sorted(config.raw_root.glob(pattern)):
-                _append_from_file(file)
-            if network_frames:
-                break
-    if not network_frames:
-        return pd.DataFrame(columns=["src", "dst", "protocol"])
-    df = pd.concat(network_frames, ignore_index=True)
-    col_map: Dict[str, str] = {}
-    for key, aliases in NETWORK_COLUMN_ALIASES.items():
-        required = key in {"src", "dst"}
-        try:
-            col_map[key] = _select_column(df, aliases, required=required)
-        except KeyError:
-            if required:
-                raise
-            col_map[key] = ""
-    rename_map = {col_map[k]: k for k in col_map if col_map[k]}
-    df = df.rename(columns=rename_map)
-    for col in ("src", "dst"):
-        if col in df.columns:
-            df[col] = df[col].astype(str)
-    if "timestamp" in df.columns:
-        if not np.issubdtype(df["timestamp"].dtype, np.number):
-            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce").astype("Int64") / 1e9
-        df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
-    else:
-        df["timestamp"] = np.nan
-    if "label" in df.columns:
-        df["label"] = df["label"].astype(str)
-    if "protocol" in df.columns:
-        df["protocol"] = df["protocol"].astype(str)
+        candidates.extend(sorted(config.raw_root.glob("**/*network*.csv")))
+    # historical fallbacks inside the repo for quick starts
+    repo_default = Path("src/data/train_test_network.csv")
+    if repo_default.exists():
+        candidates.append(repo_default)
+    return candidates
 
-    for column in df.columns:
-        if column in EXCLUDED_NETWORK_FEATURE_COLUMNS:
-            continue
-        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+def _load_network_dataframe(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if df.empty:
+        raise RuntimeError(f"Network CSV {path} is empty – cannot build graphs.")
+    # Normalise column names to lower-case for easier matching
+    df.columns = [col.lower() for col in df.columns]
     return df
 
 
-def _row_fallback_windows(
-    df: pd.DataFrame, min_chunk_size: int, target_windows: int
-) -> Iterable[pd.DataFrame]:
-    if df.empty:
-        yield df
-        return
-    if min_chunk_size <= 0:
-        min_chunk_size = 1
-    target_windows = max(3, int(target_windows))
-    # Approximate the desired chunk size so that we generate enough windows to
-    # satisfy downstream split requirements without materialising tens of
-    # thousands of miniature chunks.
-    approx_chunk_size = max(
-        min_chunk_size,
-        int(np.ceil(len(df) / target_windows)) if target_windows else len(df),
-    )
-    chunk_count = int(np.ceil(len(df) / approx_chunk_size))
-    # Guarantee at least three chunks when sufficient rows are available so
-    # train/val/test splits remain feasible.
-    if chunk_count < 3 and len(df) >= min_chunk_size * 3:
-        chunk_count = 3
-    if chunk_count < 2 and len(df) >= min_chunk_size * 2:
-        chunk_count = 2
-    chunk_count = max(1, min(chunk_count, len(df)))
-    if chunk_count <= 1:
-        yield df
-        return
-    sorted_df = df.sort_index()
-    indices = np.array_split(sorted_df.index.to_numpy(), chunk_count)
-    for idx in indices:
-        if idx.size == 0:
-            continue
-        yield sorted_df.loc[idx]
+# ---------------------------------------------------------------------------
+# Column resolution helpers mirroring TrustGuard's preprocessing
+# ---------------------------------------------------------------------------
 
 
-def _window_iterator(
-    df: pd.DataFrame,
-    window: float,
+def _resolve_column(df: pd.DataFrame, options: Sequence[str]) -> Optional[str]:
+    for candidate in options:
+        if candidate.lower() in df.columns:
+            return candidate.lower()
+    return None
+
+
+def _resolve_required_column(df: pd.DataFrame, options: Sequence[str], description: str) -> str:
+    column = _resolve_column(df, options)
+    if column is None:
+        raise RuntimeError(
+            f"Could not find a column for {description}. Looked for: {', '.join(options)}."
+        )
+    return column
+
+
+# ---------------------------------------------------------------------------
+# Window generation and graph construction
+# ---------------------------------------------------------------------------
+
+
+def _extract_timestamps(df: pd.DataFrame) -> Tuple[np.ndarray, bool]:
+    ts_col = _resolve_column(df, ["ts", "timestamp", "time", "date"])
+    if ts_col is None:
+        # Fallback: fabricate a pseudo timeline using the row index.  This
+        # mirrors TrustGuard's behaviour when working with subsets lacking
+        # explicit timestamps.
+        return np.arange(len(df), dtype=float), False
+
+    values = df[ts_col]
+    if np.issubdtype(values.dtype, np.number):
+        ts_seconds = values.astype(float).to_numpy()
+        return ts_seconds, True
+
+    parsed = pd.to_datetime(values, errors="coerce")
+    if parsed.isnull().all():
+        # Unable to parse the textual timestamps, fall back to row indices.
+        return np.arange(len(df), dtype=float), False
+    ts_seconds = parsed.astype("int64") / 1_000_000_000
+    return ts_seconds.to_numpy(), True
+
+
+def _iter_time_windows(
+    timestamps: np.ndarray,
+    has_real_time: bool,
+    window_size: float,
     stride: float,
-    min_chunk_size: int,
-    target_windows: int,
-) -> Iterable[pd.DataFrame]:
-    if "timestamp" not in df.columns:
-        yield from _row_fallback_windows(df, min_chunk_size, target_windows)
+    min_rows: int,
+) -> Iterable[Tuple[int, np.ndarray]]:
+    """Yield index arrays for each temporal window.
+
+    Parameters mirror TrustGuard's sliding-window generation.  When true
+    timestamps are missing we interpret ``window_size`` and ``stride`` as row
+    counts to retain deterministic behaviour.
+    """
+
+    if len(timestamps) == 0:
         return
-    timestamp_series = pd.to_numeric(df["timestamp"], errors="coerce")
-    valid = timestamp_series.dropna()
-    if valid.empty:
-        yield from _row_fallback_windows(df, min_chunk_size, target_windows)
-        return
-    start = float(valid.min())
-    end = float(valid.max())
-    if not np.isfinite(start) or not np.isfinite(end) or end - start < window:
-        yield from _row_fallback_windows(df, min_chunk_size, target_windows)
-        return
-    current = start
-    while current <= end:
-        mask = (timestamp_series >= current) & (timestamp_series < current + window)
-        chunk = df.loc[mask]
-        if not chunk.empty:
-            yield chunk
-        current += stride
-        if stride <= 0:
-            break
+
+    if has_real_time:
+        order = np.argsort(timestamps)
+        ordered_ts = timestamps[order]
+        start_time = float(ordered_ts[0])
+        end_time = float(ordered_ts[-1])
+        window = float(window_size)
+        step = max(float(stride), 1.0)
+        current = start_time
+        while current <= end_time:
+            mask = (ordered_ts >= current) & (ordered_ts < current + window)
+            indices = order[mask]
+            if indices.size >= min_rows:
+                yield int(current), indices
+            current += step
+    else:
+        # Interpret sizes as counts
+        order = np.arange(len(timestamps))
+        window_count = max(int(round(window_size)), min_rows)
+        step = max(int(round(stride)), 1)
+        for start in range(0, len(order), step):
+            stop = start + window_count
+            indices = order[start:stop]
+            if indices.size >= min_rows:
+                yield start, indices
 
 
-def _build_edges(network_df: pd.DataFrame, devices: List[str]) -> Tuple[np.ndarray, np.ndarray]:
-    if network_df.empty or len(devices) < 2:
-        return np.empty((2, 0), dtype=np.int64), np.empty((0,), dtype=np.float32)
-    id_to_idx = {device: idx for idx, device in enumerate(devices)}
-    counts: Dict[Tuple[int, int], int] = {}
-    for _, row in network_df.iterrows():
-        src = row.get("src")
-        dst = row.get("dst")
-        if pd.isna(src) or pd.isna(dst):
-            continue
-        if src not in id_to_idx or dst not in id_to_idx:
-            continue
-        src_idx, dst_idx = id_to_idx[src], id_to_idx[dst]
-        counts[(src_idx, dst_idx)] = counts.get((src_idx, dst_idx), 0) + 1
-        counts[(dst_idx, src_idx)] = counts.get((dst_idx, src_idx), 0) + 1
-    if not counts:
-        return np.empty((2, 0), dtype=np.int64), np.empty((0,), dtype=np.float32)
-    edges = np.array(list(counts.keys()), dtype=np.int64).T
-    weights = np.array(list(counts.values()), dtype=np.float32)
-    # Normalise weights
-    if weights.size:
-        weights = weights / weights.max()
-    return edges, weights
+def _aggregate_window(
+    df: pd.DataFrame,
+    index_array: np.ndarray,
+    time_anchor: float,
+    has_real_time: bool,
+    src_col: str,
+    dst_col: str,
+    src_port_col: Optional[str],
+    dst_port_col: Optional[str],
+    duration_col: Optional[str],
+    orig_bytes_col: Optional[str],
+    resp_bytes_col: Optional[str],
+    orig_pkts_col: Optional[str],
+    resp_pkts_col: Optional[str],
+    label_col: Optional[str],
+    min_nodes: int,
+) -> Optional[Data]:
+    window_df = df.iloc[index_array]
+    if window_df.empty:
+        return None
 
+    # Determine the window bounds for metadata
+    if has_real_time and "_egt_ts" in window_df:
+        ts_values = pd.to_numeric(window_df["_egt_ts"], errors="coerce").to_numpy(dtype=float)
+        if ts_values.size > 0 and not np.isnan(ts_values).all():
+            window_start = float(np.nanmin(ts_values))
+            window_end = float(np.nanmax(ts_values))
+        else:
+            window_start = float(time_anchor)
+            window_end = float(time_anchor + window_df.shape[0])
+    else:
+        window_start = float(index_array.min())
+        window_end = float(index_array.max())
 
-def _aggregate_features(chunk: pd.DataFrame) -> Tuple[np.ndarray, List[str], List[str]]:
-    metrics = [col for col in chunk.columns if col not in EXCLUDED_TELEMETRY_COLUMNS]
-    grouped = chunk.groupby("device_id")
-    device_ids: List[str] = []
-    feature_list: List[np.ndarray] = []
-    for device_id, group in grouped:
-        device_id_str = str(device_id)
-        device_ids.append(device_id_str)
-        stats = []
-        for metric in metrics:
-            values = group[metric].dropna().to_numpy()
-            mean, std, max_val = _compute_stats(values)
-            stats.extend([mean, std, max_val])
-        stats.append(float(len(group)))
-        feature_list.append(np.array(stats, dtype=np.float32))
-    if not feature_list:
-        return np.empty((0, 0), dtype=np.float32), [], []
-    features = np.stack(feature_list)
-    feature_names: List[str] = []
-    for metric in metrics:
-        feature_names.extend([f"{metric}_mean", f"{metric}_std", f"{metric}_max"])
-    feature_names.append("message_count")
-    return features, device_ids, feature_names
+    # Helper to retrieve numeric columns with fallback zeros
+    def column_or_default(name: Optional[str]) -> np.ndarray:
+        if name is None:
+            return np.zeros(len(window_df), dtype=float)
+        series = window_df[name]
+        numeric = pd.to_numeric(series, errors="coerce").fillna(0.0)
+        return numeric.to_numpy(dtype=float)
 
+    src_nodes = window_df[src_col].astype(str).to_numpy()
+    dst_nodes = window_df[dst_col].astype(str).to_numpy()
+    orig_bytes = column_or_default(orig_bytes_col)
+    resp_bytes = column_or_default(resp_bytes_col)
+    orig_pkts = column_or_default(orig_pkts_col)
+    resp_pkts = column_or_default(resp_pkts_col)
+    durations = column_or_default(duration_col)
 
-def _aggregate_labels(chunk: pd.DataFrame) -> Dict[str, int]:
-    label_col = None
-    for candidate in ("label", "attack", "target", "is_anomaly", "class"):
-        if candidate in chunk.columns:
-            label_col = candidate
-            break
-    if label_col is None:
-        return {device: 0 for device in chunk["device_id"].unique()}
-    grouped = chunk.groupby("device_id")[label_col]
-    normal_tokens = {"normal", "benign", "0", "false", "no"}
-    labels: Dict[str, int] = {}
-    for device, series in grouped:
-        labels[str(device)] = _reduce_label_series(series, normal_tokens)
-    return labels
+    edge_stats: Dict[Tuple[str, str], Dict[str, float]] = {}
+    node_stats: Dict[str, Dict[str, float]] = {}
 
+    labels = None
+    if label_col is not None and label_col in window_df:
+        labels = window_df[label_col].astype(str).str.lower().to_numpy()
 
-def _infer_numeric_columns(df: pd.DataFrame) -> List[str]:
-    numeric_cols: List[str] = []
-    for column in df.columns:
-        if column in EXCLUDED_NETWORK_FEATURE_COLUMNS:
-            continue
-        if pd.api.types.is_numeric_dtype(df[column]):
-            numeric_cols.append(column)
-    return numeric_cols
+    for idx, (src, dst) in enumerate(zip(src_nodes, dst_nodes)):
+        key = (src, dst)
+        stats = edge_stats.setdefault(
+            key,
+            {
+                "records": 0.0,
+                "bytes_total": 0.0,
+                "pkts_total": 0.0,
+                "duration_sum": 0.0,
+            },
+        )
+        stats["records"] += 1.0
+        stats["bytes_total"] += float(orig_bytes[idx] + resp_bytes[idx])
+        stats["pkts_total"] += float(orig_pkts[idx] + resp_pkts[idx])
+        stats["duration_sum"] += float(durations[idx])
 
+        src_stats = node_stats.setdefault(
+            src,
+            {
+                "out_bytes": 0.0,
+                "out_pkts": 0.0,
+                "in_bytes": 0.0,
+                "in_pkts": 0.0,
+                "out_degree": 0.0,
+                "in_degree": 0.0,
+                "partners": set(),
+                "attack_records": 0.0,
+                "total_records": 0.0,
+            },
+        )
+        dst_stats = node_stats.setdefault(
+            dst,
+            {
+                "out_bytes": 0.0,
+                "out_pkts": 0.0,
+                "in_bytes": 0.0,
+                "in_pkts": 0.0,
+                "out_degree": 0.0,
+                "in_degree": 0.0,
+                "partners": set(),
+                "attack_records": 0.0,
+                "total_records": 0.0,
+            },
+        )
+        src_stats["out_bytes"] += float(orig_bytes[idx])
+        src_stats["out_pkts"] += float(orig_pkts[idx])
+        src_stats["out_degree"] += 1.0
+        src_stats["partners"].add(dst)
+        src_stats["total_records"] += 1.0
 
-def _aggregate_network_features(
-    chunk: pd.DataFrame, numeric_columns: Sequence[str]
-) -> Tuple[np.ndarray, List[str], List[str]]:
-    device_series: List[pd.Series] = []
-    if "src" in chunk.columns:
-        device_series.append(chunk["src"].astype(str))
-    if "dst" in chunk.columns:
-        device_series.append(chunk["dst"].astype(str))
-    if not device_series:
-        return np.empty((0, 0), dtype=np.float32), [], []
-    devices_array = pd.unique(pd.concat(device_series, ignore_index=True).dropna()).astype(str)
-    device_ids: List[str] = devices_array.tolist()
-    feature_list: List[np.ndarray] = []
-    feature_names: List[str] = ["outgoing_count", "incoming_count"]
-    for column in numeric_columns:
-        feature_names.extend(
+        dst_stats["in_bytes"] += float(resp_bytes[idx])
+        dst_stats["in_pkts"] += float(resp_pkts[idx])
+        dst_stats["in_degree"] += 1.0
+        dst_stats["partners"].add(src)
+        dst_stats["total_records"] += 1.0
+
+        if labels is not None:
+            is_attack = 1.0 if labels[idx] != "benign" else 0.0
+            src_stats["attack_records"] += is_attack
+            dst_stats["attack_records"] += is_attack
+
+    if len(node_stats) < min_nodes:
+        return None
+
+    node_index = {node: idx for idx, node in enumerate(sorted(node_stats))}
+    node_features: List[List[float]] = []
+    for node in sorted(node_stats):
+        stats = node_stats[node]
+        total_records = max(stats["total_records"], 1.0)
+        unique_partners = float(len(stats["partners"]))
+        attack_ratio = stats["attack_records"] / total_records
+        node_features.append(
             [
-                f"out_{column}_mean",
-                f"out_{column}_std",
-                f"out_{column}_max",
-                f"in_{column}_mean",
-                f"in_{column}_std",
-                f"in_{column}_max",
+                stats["out_bytes"],
+                stats["in_bytes"],
+                stats["out_pkts"],
+                stats["in_pkts"],
+                stats["out_degree"],
+                stats["in_degree"],
+                unique_partners,
+                attack_ratio,
             ]
         )
-    empty_frame = chunk.iloc[0:0]
-    for device_str in device_ids:
-        outgoing = chunk[chunk["src"] == device_str] if "src" in chunk.columns else empty_frame
-        incoming = chunk[chunk["dst"] == device_str] if "dst" in chunk.columns else empty_frame
-        stats: List[float] = [float(len(outgoing)), float(len(incoming))]
-        for column in numeric_columns:
-            out_values = outgoing[column].dropna().to_numpy() if column in outgoing.columns else np.array([])
-            in_values = incoming[column].dropna().to_numpy() if column in incoming.columns else np.array([])
-            stats.extend(_compute_stats(out_values))
-            stats.extend(_compute_stats(in_values))
-        feature_list.append(np.array(stats, dtype=np.float32))
-    if not feature_list:
-        return np.empty((0, 0), dtype=np.float32), [], []
-    return np.stack(feature_list), device_ids, feature_names
 
-
-def _aggregate_network_labels(chunk: pd.DataFrame) -> Dict[str, int]:
-    label_col = None
-    for candidate in ("label", "attack", "target", "is_anomaly", "class"):
-        if candidate in chunk.columns:
-            label_col = candidate
-            break
-    device_series: List[pd.Series] = []
-    if "src" in chunk.columns:
-        device_series.append(chunk["src"].astype(str))
-    if "dst" in chunk.columns:
-        device_series.append(chunk["dst"].astype(str))
-    devices: List[str] = []
-    if device_series:
-        devices = pd.unique(pd.concat(device_series, ignore_index=True).dropna()).astype(str).tolist()
-    labels: Dict[str, int] = {device: 0 for device in devices}
-    if label_col is None:
-        return labels
-    for role in ("src", "dst"):
-        if role not in chunk.columns:
-            continue
-        grouped = chunk.groupby(role)[label_col]
-        for device, series in grouped:
-            device_str = str(device)
-            labels[device_str] = max(labels.get(device_str, 0), _reduce_label_series(series))
-    return labels
-
-
-def _extract_graphs_from_network(
-    network_df: pd.DataFrame, config: TONTConfig
-) -> Tuple[List[Data], Dict[str, object]]:
-    if network_df.empty:
-        searched_hint = (
-            f"explicit file {config.network_file}" if config.network_file else "default search locations"
+    edge_index = np.zeros((2, len(edge_stats)), dtype=np.int64)
+    edge_features: List[List[float]] = []
+    for col, ((src, dst), stats) in enumerate(sorted(edge_stats.items())):
+        edge_index[0, col] = node_index[src]
+        edge_index[1, col] = node_index[dst]
+        avg_duration = stats["duration_sum"] / max(stats["records"], 1.0)
+        edge_features.append(
+            [
+                stats["records"],
+                stats["bytes_total"],
+                stats["pkts_total"],
+                avg_duration,
+            ]
         )
-        raise RuntimeError(
-            "Network CSV files were not found. Provide Train_Test_Network.csv or matching files to continue. "
-            f"Checked {searched_hint} within {config.raw_root}."
+
+    label_value = 0
+    if labels is not None:
+        label_value = int(any(lbl != "benign" for lbl in labels))
+
+    data = Data()
+    data.x = torch.tensor(node_features, dtype=torch.float32)
+    data.edge_index = torch.tensor(edge_index, dtype=torch.long)
+    data.edge_attr = torch.tensor(edge_features, dtype=torch.float32)
+    data.y = torch.tensor([label_value], dtype=torch.long)
+    data.num_nodes = data.x.size(0)
+    data.window_range = torch.tensor([window_start, window_end], dtype=torch.float32)
+
+    if src_port_col is not None and dst_port_col is not None:
+        # Capture histogram style statistics to mimic TrustGuard's port buckets
+        ports = window_df[[src_port_col, dst_port_col]].apply(pd.to_numeric, errors="coerce").fillna(0)
+        data.port_stats = torch.tensor([
+            float((ports[src_port_col] < 1024).sum()),
+            float(((ports[src_port_col] >= 1024) & (ports[src_port_col] < 49152)).sum()),
+            float((ports[src_port_col] >= 49152).sum()),
+            float((ports[dst_port_col] < 1024).sum()),
+            float(((ports[dst_port_col] >= 1024) & (ports[dst_port_col] < 49152)).sum()),
+            float((ports[dst_port_col] >= 49152).sum()),
+        ], dtype=torch.float32)
+
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Dataset splitting and normalisation utilities
+# ---------------------------------------------------------------------------
+
+
+def _fit_scaler(tensors: List[torch.Tensor]) -> Optional[StandardScaler]:
+    if not tensors:
+        return None
+    stacked = torch.cat(tensors, dim=0).numpy()
+    if stacked.size == 0:
+        return None
+    scaler = StandardScaler()
+    scaler.fit(stacked)
+    return scaler
+
+
+def _apply_scaler(scaler: Optional[StandardScaler], tensor: torch.Tensor) -> torch.Tensor:
+    if scaler is None:
+        return tensor
+    transformed = scaler.transform(tensor.numpy())
+    return torch.tensor(transformed, dtype=torch.float32)
+
+
+# ---------------------------------------------------------------------------
+# Main orchestration
+# ---------------------------------------------------------------------------
+
+
+def run_preprocessing(config: PreprocessConfig) -> None:
+    candidates = _candidate_network_paths(config)
+    if not candidates:
+        raise FileNotFoundError(
+            "Could not locate Train_Test_Network.csv. Specify --network-file or place the file "
+            "under data/raw/ton_iot as in the TrustGuard project."
         )
-    numeric_columns = _infer_numeric_columns(network_df)
-    graphs: List[Data] = []
-    feature_cache: List[np.ndarray] = []
-    metadata_feature_names: Optional[List[str]] = None
-    target_windows = max(3, config.min_split_graphs * 3)
-    for chunk in tqdm(
-        list(
-            _window_iterator(
-                network_df,
-                config.window_size,
-                config.stride,
-                config.min_nodes,
-                target_windows,
-            )
-        ),
-        desc="Processing windows",
+
+    network_path = candidates[0]
+    if not network_path.is_absolute():
+        network_path = network_path.resolve()
+    df = _load_network_dataframe(network_path)
+    timestamps, has_real_time = _extract_timestamps(df)
+    df = df.copy()
+    df["_egt_ts"] = timestamps
+    if has_real_time:
+        df = df.sort_values("_egt_ts").reset_index(drop=True)
+        timestamps = df["_egt_ts"].to_numpy()
+
+    src_col = _resolve_required_column(df, ["id.orig_h", "src_ip", "source", "source_ip"], "source IP address")
+    dst_col = _resolve_required_column(df, ["id.resp_h", "dst_ip", "destination", "dest_ip"], "destination IP address")
+    src_port_col = _resolve_column(df, ["id.orig_p", "src_port", "source_port", "sport"])
+    dst_port_col = _resolve_column(df, ["id.resp_p", "dst_port", "destination_port", "dport"])
+    duration_col = _resolve_column(df, ["duration", "flow_duration", "dur"])
+    orig_bytes_col = _resolve_column(df, ["orig_bytes", "src_bytes", "bytes_sent", "bytes"])
+    resp_bytes_col = _resolve_column(df, ["resp_bytes", "dst_bytes", "bytes_received"])
+    orig_pkts_col = _resolve_column(df, ["orig_pkts", "src_pkts", "packets_sent"])
+    resp_pkts_col = _resolve_column(df, ["resp_pkts", "dst_pkts", "packets_received"])
+    label_col = _resolve_column(df, ["label", "detailed-label", "class", "attack" ])
+
+    windows: List[Data] = []
+    node_features_to_scale: List[torch.Tensor] = []
+    edge_features_to_scale: List[torch.Tensor] = []
+
+    for time_anchor, indices in _iter_time_windows(
+        timestamps,
+        has_real_time,
+        config.window_size,
+        config.stride,
+        config.min_rows_per_window,
     ):
-        features, device_ids, feature_names = _aggregate_network_features(chunk, numeric_columns)
-        if features.size == 0 or len(device_ids) < config.min_nodes:
-            continue
-        labels_map = _aggregate_network_labels(chunk)
-        labels = torch.tensor([labels_map.get(device, 0) for device in device_ids], dtype=torch.long)
-        window_network = chunk if not chunk.empty else network_df
-        edge_index, edge_weight = _build_edges(window_network, list(device_ids))
-        data = Data(
-            x=torch.from_numpy(features.astype(np.float32)),
-            edge_index=torch.from_numpy(edge_index),
-            edge_weight=torch.from_numpy(edge_weight),
-            y=labels,
-        )
-        data.device_ids = list(device_ids)
-        if "timestamp" in chunk.columns and not chunk["timestamp"].dropna().empty:
-            data.window_start = float(np.nanmin(chunk["timestamp"].to_numpy()))
-            data.window_end = float(np.nanmax(chunk["timestamp"].to_numpy()))
-        graphs.append(data)
-        feature_cache.append(features)
-        if metadata_feature_names is None:
-            metadata_feature_names = feature_names
-
-    if not graphs:
-        raise RuntimeError(
-            "Network-only preprocessing did not yield any graphs. Check that the CSV contains src/dst columns and adjust"
-            " window parameters."
-        )
-
-    scaler = StandardScaler().fit(np.vstack(feature_cache))
-    for data in graphs:
-        data.x = torch.from_numpy(scaler.transform(data.x.numpy()).astype(np.float32))
-
-    metadata = {
-        "feature_names": metadata_feature_names or [],
-        "num_features": int(graphs[0].x.size(-1)),
-        "num_classes": 2,
-        "window_size": config.window_size,
-        "stride": config.stride,
-        "scaler": {"mean": scaler.mean_.tolist(), "scale": scaler.scale_.tolist()},
-        "source_modalities": ["network"],
-    }
-    return graphs, metadata
-
-
-def _extract_graphs_from_telemetry(
-    telemetry_df: pd.DataFrame, network_df: pd.DataFrame, config: TONTConfig
-) -> Tuple[List[Data], Dict[str, object]]:
-    graphs: List[Data] = []
-    feature_cache: List[np.ndarray] = []
-    metadata_feature_names: Optional[List[str]] = None
-    network_df = network_df.copy()
-    target_windows = max(3, config.min_split_graphs * 3)
-    for chunk in tqdm(
-        list(
-            _window_iterator(
-                telemetry_df,
-                config.window_size,
-                config.stride,
-                config.min_nodes,
-                target_windows,
-            )
-        ),
-        desc="Processing windows",
-    ):
-        features, device_ids, feature_names = _aggregate_features(chunk)
-        if features.size == 0 or len(device_ids) < config.min_nodes:
-            continue
-        labels_map = _aggregate_labels(chunk)
-        labels = torch.tensor([labels_map.get(device, 0) for device in device_ids], dtype=torch.long)
-        window_network = network_df[network_df["src"].isin(device_ids) & network_df["dst"].isin(device_ids)] if not network_df.empty else network_df
-        edge_index, edge_weight = _build_edges(window_network, device_ids)
-        data = Data(
-            x=torch.from_numpy(features.astype(np.float32)),
-            edge_index=torch.from_numpy(edge_index),
-            edge_weight=torch.from_numpy(edge_weight),
-            y=labels,
-        )
-        data.device_ids = device_ids
-        data.window_start = float(chunk["timestamp"].min())
-        data.window_end = float(chunk["timestamp"].max())
-        graphs.append(data)
-        feature_cache.append(features)
-        if metadata_feature_names is None:
-            metadata_feature_names = feature_names
-
-    if not graphs:
-        raise RuntimeError("No graphs generated from TON_IoT telemetry. Check raw files and parameters.")
-
-    scaler = StandardScaler().fit(np.vstack(feature_cache))
-    for data in graphs:
-        data.x = torch.from_numpy(scaler.transform(data.x.numpy()).astype(np.float32))
-
-    metadata = {
-        "feature_names": metadata_feature_names or [],
-        "num_features": int(graphs[0].x.size(-1)),
-        "num_classes": 2,
-        "window_size": config.window_size,
-        "stride": config.stride,
-        "scaler": {"mean": scaler.mean_.tolist(), "scale": scaler.scale_.tolist()},
-        "source_modalities": ["telemetry"] + (["network"] if not network_df.empty else []),
-    }
-    return graphs, metadata
-
-
-def _safe_split(indices: np.ndarray, labels: np.ndarray, test_size: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
-    try:
-        first, second = train_test_split(
+        graph = _aggregate_window(
+            df,
             indices,
-            test_size=test_size,
-            random_state=seed,
-            stratify=labels if len(np.unique(labels)) > 1 else None,
+            float(time_anchor),
+            has_real_time,
+            src_col,
+            dst_col,
+            src_port_col,
+            dst_port_col,
+            duration_col,
+            orig_bytes_col,
+            resp_bytes_col,
+            orig_pkts_col,
+            resp_pkts_col,
+            label_col,
+            config.min_nodes,
         )
-    except ValueError:
-        if indices.size <= 1:
-            return indices.astype(int), np.empty(0, dtype=int)
-        rng = np.random.default_rng(seed)
-        shuffled = rng.permutation(indices)
-        second_count = int(round(len(shuffled) * test_size))
-        second_count = max(1, second_count)
-        if second_count >= len(shuffled):
-            second_count = len(shuffled) - 1
-        second = shuffled[:second_count]
-        first = shuffled[second_count:]
-    return np.array(first, dtype=int), np.array(second, dtype=int)
+        if graph is not None:
+            windows.append(graph)
+            node_features_to_scale.append(graph.x)
+            if graph.edge_attr is not None and graph.edge_attr.numel() > 0:
+                edge_features_to_scale.append(graph.edge_attr)
 
-
-def _stratified_random_split(graphs: List[Data], seed: int) -> Tuple[Dict[str, List[Data]], Dict[str, object]]:
-    indices = np.arange(len(graphs))
-    graph_labels = np.array([_graph_label(data) for data in graphs])
-    train_idx, temp_idx = _safe_split(indices, graph_labels, test_size=0.3, seed=seed)
-    temp_labels = graph_labels[temp_idx]
-    val_idx, test_idx = _safe_split(temp_idx, temp_labels, test_size=0.5, seed=seed)
-    split: Dict[str, List[Data]] = {
-        "train": [graphs[i] for i in train_idx],
-        "val": [graphs[i] for i in val_idx],
-        "test": [graphs[i] for i in test_idx],
-    }
-
-    diagnostics: Dict[str, object] = {"split_method": "stratified_random"}
-
-    if not graphs:
-        return split, diagnostics
-
-    empty_splits = [name for name, items in split.items() if len(items) == 0]
-    if empty_splits:
-        redistribution_log: List[Tuple[str, str]] = []
-        for target in empty_splits:
-            donors = sorted(
-                [name for name, items in split.items() if len(items) > 1 and name != target],
-                key=lambda name: len(split[name]),
-                reverse=True,
-            )
-            moved = False
-            for donor in donors:
-                if split[donor]:
-                    split[target].append(split[donor].pop())
-                    redistribution_log.append((donor, target))
-                    moved = True
-                    break
-            if not moved:
-                continue
-        empty_splits = [name for name, items in split.items() if len(items) == 0]
-        if empty_splits:
-            diagnostics["empty_splits"] = empty_splits
-            diagnostics["total_graphs"] = len(graphs)
-        elif redistribution_log:
-            diagnostics["redistribution"] = redistribution_log
-
-    total_label_counts = _label_counts(graphs)
-
-    def _counts_for_split(name: str) -> Dict[int, int]:
-        return _label_counts(split.get(name, []))
-
-    split_label_counts = {name: _counts_for_split(name) for name in split}
-    required_labels = [label for label, count in total_label_counts.items() if count > 0]
-    priority = [name for name in ("train", "val", "test") if name in split]
-    priority_index = {name: idx for idx, name in enumerate(priority)}
-    class_moves: List[Tuple[str, str, int]] = []
-    unresolved: List[Dict[str, int]] = []
-
-    for label in required_labels:
-        for target in priority:
-            if not split[target]:
-                continue
-            if split_label_counts[target][label] > 0:
-                continue
-            donors = sorted(
-                [
-                    name
-                    for name in split
-                    if name != target and split_label_counts[name][label] > 0 and len(split[name]) > 1
-                ],
-                key=lambda name: (split_label_counts[name][label], len(split[name])),
-                reverse=True,
-            )
-            moved = False
-            for donor in donors:
-                donor_priority = priority_index.get(donor, len(priority))
-                target_priority = priority_index.get(target, len(priority))
-                if donor_priority <= target_priority and split_label_counts[donor][label] <= 1:
-                    continue
-                for idx, graph in enumerate(split[donor]):
-                    if _graph_label(graph) == label:
-                        split[target].append(split[donor].pop(idx))
-                        split_label_counts[target][label] += 1
-                        split_label_counts[donor][label] -= 1
-                        class_moves.append((donor, target, int(label)))
-                        moved = True
-                        break
-                if moved:
-                    break
-            if not moved:
-                unresolved.append({"split": target, "label": int(label)})
-
-    if class_moves:
-        diagnostics["class_redistribution"] = class_moves
-    if unresolved:
-        diagnostics["unresolved_class_gaps"] = unresolved
-
-    final_counts = {name: _label_counts(items) for name, items in split.items()}
-    diagnostics["label_distribution"] = {
-        name: {"neg": counts[0], "pos": counts[1]} for name, counts in final_counts.items()
-    }
-    diagnostics["total_label_counts"] = {"neg": total_label_counts[0], "pos": total_label_counts[1]}
-
-    return split, diagnostics
-
-
-def _allocate_temporal_counts(total: int, ratios: Tuple[float, float, float]) -> List[int]:
-    if total < len(ratios):
-        raise ValueError("insufficient_graphs_for_temporal_split")
-
-    raw = np.array(ratios, dtype=float) * float(total)
-    counts = np.floor(raw).astype(int)
-    remainder = int(total - counts.sum())
-    if remainder > 0:
-        fractional = raw - counts
-        order = np.argsort(-fractional)
-        for idx in order[:remainder]:
-            counts[idx] += 1
-    counts = counts.tolist()
-
-    for idx in range(len(counts)):
-        if counts[idx] == 0:
-            donor = int(np.argmax(counts))
-            if counts[donor] <= 1:
-                raise ValueError("unable_to_allocate_counts")
-            counts[donor] -= 1
-            counts[idx] += 1
-
-    if sum(counts) != total:
-        counts[-1] += total - sum(counts)
-
-    if any(count <= 0 for count in counts):
-        raise ValueError("temporal_split_produced_empty_segment")
-    return counts
-
-
-def _temporal_split_graphs(
-    graphs: List[Data], config: TONTConfig
-) -> Tuple[Dict[str, List[Data]], Dict[str, object]]:
-    diagnostics: Dict[str, object] = {"split_method": "temporal"}
-    split_names = ("train", "val", "test")
-    if not graphs:
-        return {name: [] for name in split_names}, diagnostics
-
-    window_map: Dict[int, Tuple[float, float]] = {}
-    ordering: List[Tuple[int, float]] = []
-    for idx, graph in enumerate(graphs):
-        start = getattr(graph, "window_start", None)
-        if start is None or not np.isfinite(float(start)):
-            raise ValueError("missing_window_start")
-        start_f = float(start)
-        end = getattr(graph, "window_end", None)
-        end_f = float(end) if end is not None and np.isfinite(float(end)) else start_f
-        if end_f < start_f:
-            end_f = start_f
-        window_map[idx] = (start_f, end_f)
-        ordering.append((idx, start_f))
-
-    ordering.sort(key=lambda item: item[1])
-    sorted_indices = [idx for idx, _ in ordering]
-    counts = _allocate_temporal_counts(len(sorted_indices), (0.6, 0.2, 0.2))
-
-    train_end = counts[0]
-    val_end = counts[0] + counts[1]
-    train_idx = sorted_indices[:train_end]
-    val_idx = sorted_indices[train_end:val_end]
-    test_idx = sorted_indices[val_end:]
-
-    if config.time_buffer > 0:
-        buffer = config.time_buffer
-        removed = 0
-        if len(train_idx) > buffer:
-            train_idx = train_idx[:-buffer]
-            removed += buffer
-        if len(val_idx) > buffer:
-            val_idx = val_idx[buffer:]
-            removed += buffer
-        if len(val_idx) > buffer:
-            val_idx = val_idx[:-buffer]
-            removed += buffer
-        if len(test_idx) > buffer:
-            test_idx = test_idx[buffer:]
-            removed += buffer
-        if removed:
-            if any(len(indices) == 0 for indices in (train_idx, val_idx, test_idx)):
-                raise ValueError("buffer_removed_all")
-            diagnostics["temporal_buffer"] = {"removed_graphs": int(removed)}
-
-    split = {
-        "train": [graphs[i] for i in train_idx],
-        "val": [graphs[i] for i in val_idx],
-        "test": [graphs[i] for i in test_idx],
-    }
-
-    boundaries: Dict[str, Dict[str, float]] = {}
-    for name, indices in zip(split_names, (train_idx, val_idx, test_idx)):
-        if not indices:
-            continue
-        starts = [window_map[i][0] for i in indices]
-        ends = [window_map[i][1] for i in indices]
-        boundaries[name] = {"start": float(min(starts)), "end": float(max(ends))}
-    if boundaries:
-        diagnostics["split_time_boundaries"] = boundaries
-
-    overlaps: List[Dict[str, float]] = []
-    order_pairs = [("train", "val"), ("val", "test")]
-    for first, second in order_pairs:
-        first_bounds = boundaries.get(first)
-        second_bounds = boundaries.get(second)
-        if not first_bounds or not second_bounds:
-            continue
-        if first_bounds["end"] > second_bounds["start"]:
-            overlaps.append(
-                {
-                    "pair": (first, second),
-                    "first_end": first_bounds["end"],
-                    "second_start": second_bounds["start"],
-                }
-            )
-    if overlaps:
-        diagnostics["temporal_overlap"] = overlaps
-
-    total_label_counts = _label_counts(graphs)
-    final_counts = {name: _label_counts(items) for name, items in split.items()}
-    diagnostics["label_distribution"] = {
-        name: {"neg": counts[0], "pos": counts[1]} for name, counts in final_counts.items()
-    }
-    diagnostics["total_label_counts"] = {"neg": total_label_counts[0], "pos": total_label_counts[1]}
-
-    return split, diagnostics
-
-
-def _split_graphs(graphs: List[Data], config: TONTConfig) -> Tuple[Dict[str, List[Data]], Dict[str, object]]:
-    try:
-        return _temporal_split_graphs(graphs, config)
-    except ValueError as exc:
-        split, diagnostics = _stratified_random_split(graphs, config.seed)
-        diagnostics.setdefault("split_method", "stratified_random")
-        diagnostics.setdefault("fallback_reason", str(exc))
-        return split, diagnostics
-
-
-def _candidate_configs(config: TONTConfig) -> Iterable[TONTConfig]:
-    window_scales = [1.0, 0.75, 0.5, 0.25, 0.125]
-    stride_scales = [1.0, 0.5, 0.25, 0.125]
-    min_nodes_candidates = sorted({config.min_nodes, max(2, config.min_nodes - 1), 2}, reverse=True)
-    seen: set[Tuple[int, float, float]] = set()
-    for min_nodes in min_nodes_candidates:
-        for window_scale in window_scales:
-            window = max(30.0, float(config.window_size * window_scale))
-            for stride_scale in stride_scales:
-                stride = max(10.0, float(config.stride * window_scale * stride_scale))
-                if stride > window:
-                    stride = window
-                key = (min_nodes, round(window, 4), round(stride, 4))
-                if key in seen:
-                    continue
-                seen.add(key)
-                yield replace(config, window_size=window, stride=stride, min_nodes=min_nodes)
-
-
-def _generate_graphs_with_split(
-    telemetry_df: Optional[pd.DataFrame],
-    network_df: pd.DataFrame,
-    config: TONTConfig,
-) -> Tuple[List[Data], Dict[str, object], Dict[str, List[Data]], Dict[str, object], TONTConfig, List[Dict[str, object]]]:
-    attempts: List[Dict[str, object]] = []
-    last_error: Optional[str] = None
-    for candidate in _candidate_configs(config):
-        try:
-            if telemetry_df is None:
-                graphs, metadata = _extract_graphs_from_network(network_df, candidate)
-            else:
-                graphs, metadata = _extract_graphs_from_telemetry(telemetry_df, network_df, candidate)
-        except RuntimeError as exc:
-            last_error = str(exc)
-            attempts.append(
-                {
-                    "window_size": candidate.window_size,
-                    "stride": candidate.stride,
-                    "error": last_error,
-                }
-            )
-            continue
-
-        summary = {
-            "window_size": candidate.window_size,
-            "stride": candidate.stride,
-            "num_graphs": len(graphs),
-            "min_nodes": candidate.min_nodes,
-        }
-        if len(graphs) < 3:
-            summary["reason"] = "insufficient_graphs"
-            attempts.append(summary)
-            continue
-        split, diagnostics = _split_graphs(graphs, candidate)
-        split_sizes = {name: len(items) for name, items in split.items()}
-        summary["split_sizes"] = split_sizes
-        empty_splits = diagnostics.get("empty_splits")
-        if empty_splits:
-            summary["empty_splits"] = empty_splits
-            attempts.append(summary)
-            continue
-        min_split = min(split_sizes.values()) if split_sizes else 0
-        if min_split < candidate.min_split_graphs:
-            summary["reason"] = "split_too_small"
-            summary["min_split_graphs"] = candidate.min_split_graphs
-            attempts.append(summary)
-            continue
-        label_dist = diagnostics.get("label_distribution", {})
-        coverage_failures: List[Dict[str, object]] = []
-        for split_name, counts in label_dist.items():
-            for label_key in ("neg", "pos"):
-                if counts.get(label_key, 0) < candidate.min_class_per_split:
-                    coverage_failures.append(
-                        {
-                            "split": split_name,
-                            "label": label_key,
-                            "count": counts.get(label_key, 0),
-                            "required": candidate.min_class_per_split,
-                        }
-                    )
-        if coverage_failures:
-            summary["reason"] = "class_below_min"
-            summary["label_distribution"] = label_dist
-            summary["min_class_per_split"] = candidate.min_class_per_split
-            summary["coverage_failures"] = coverage_failures
-            attempts.append(summary)
-            continue
-        diagnostics.setdefault("class_thresholds", {})
-        diagnostics["class_thresholds"].update(
-            {
-                "min_split_graphs": candidate.min_split_graphs,
-                "min_class_per_split": candidate.min_class_per_split,
-            }
+    if not windows:
+        raise RuntimeError(
+            "No valid graphs were generated from the provided CSV. Try decreasing --min-rows-per-window or --min-nodes."
         )
-        return graphs, metadata, split, diagnostics, candidate, attempts
-    detail = {
-        "attempts": attempts,
-    }
-    if last_error is not None:
-        detail["last_error"] = last_error
-    raise RuntimeError(
-        "TON_IoT preprocessing could not produce non-empty train/val/test splits. "
-        "Review window/stride parameters or lower --min-nodes. Details: "
-        f"{detail}"
-    )
 
+    # Normalise node and edge features using global scalers, as done in TrustGuard
+    node_scaler = _fit_scaler(node_features_to_scale)
+    edge_scaler = _fit_scaler(edge_features_to_scale)
+    for graph in windows:
+        graph.x = _apply_scaler(node_scaler, graph.x)
+        if graph.edge_attr is not None and graph.edge_attr.numel() > 0:
+            graph.edge_attr = _apply_scaler(edge_scaler, graph.edge_attr)
 
-def _save_split(
-    split: Dict[str, List[Data]],
-    metadata: Dict[str, object],
-    output_root: Path,
-    diagnostics: Optional[Dict[str, object]] = None,
-) -> None:
-    processed_dir = output_root / "processed"
+    # Sort by the recorded window start to enforce temporal splits
+    windows.sort(key=lambda data: float(data.window_range[0]))
+
+    num_graphs = len(windows)
+    train_count = max(int(num_graphs * config.train_ratio), 1)
+    val_count = max(int(num_graphs * config.val_ratio), 0)
+    test_count = num_graphs - train_count - val_count
+    if test_count <= 0:
+        test_count = max(1, num_graphs - train_count)
+        val_count = num_graphs - train_count - test_count
+
+    if min(train_count, val_count, test_count) < config.min_graphs_per_split:
+        raise RuntimeError(
+            "TON_IoT preprocessing produced insufficient graphs. Increase observation time, reduce --min-rows-per-window, "
+            "or lower --min-graphs-per-split."
+        )
+
+    train_graphs = windows[:train_count]
+    val_graphs = windows[train_count : train_count + val_count]
+    test_graphs = windows[train_count + val_count :]
+
+    def label_stats(graphs: Sequence[Data]) -> Dict[str, int]:
+        positives = sum(int(graph.y.item()) for graph in graphs)
+        return {"pos": positives, "neg": len(graphs) - positives}
+
+    dataset_dir = config.output_root / "toni_iot"
+    processed_dir = dataset_dir / "processed"
     processed_dir.mkdir(parents=True, exist_ok=True)
-    for name, graphs in split.items():
-        torch.save({"data_list": graphs, "metadata": metadata, "split": name}, processed_dir / f"{name}_graph.pt")
-    summary = {
-        name: {
-            "num_graphs": len(graphs),
-            "avg_nodes": float(np.mean([g.num_nodes for g in graphs])) if graphs else 0.0,
-            "attack_ratio": float(np.mean([g.y.float().mean().item() for g in graphs])) if graphs else 0.0,
-        }
-        for name, graphs in split.items()
+
+    metadata = {
+        "num_features": int(train_graphs[0].x.size(-1)) if train_graphs else 0,
+        "num_edge_features": int(train_graphs[0].edge_attr.size(-1)) if train_graphs and train_graphs[0].edge_attr is not None else 0,
+        "num_classes": 2,
+        "scalers": {
+            "node_mean": node_scaler.mean_.tolist() if node_scaler is not None else None,
+            "node_scale": node_scaler.scale_.tolist() if node_scaler is not None else None,
+            "edge_mean": edge_scaler.mean_.tolist() if edge_scaler is not None else None,
+            "edge_scale": edge_scaler.scale_.tolist() if edge_scaler is not None else None,
+        },
+        "window_settings": {
+            "window_size": config.window_size,
+            "stride": config.stride,
+            "min_rows_per_window": config.min_rows_per_window,
+            "min_nodes": config.min_nodes,
+        },
+        "source_csv": str(network_path),
     }
-    if diagnostics:
-        summary["diagnostics"] = diagnostics
-    with open(processed_dir / "summary.json", "w", encoding="utf-8") as fp:
-        json.dump(summary, fp, indent=2)
+
+    def save_split(name: str, graphs: Sequence[Data]) -> None:
+        torch.save({"data_list": list(graphs), "metadata": metadata}, processed_dir / f"{name}_graph.pt")
+
+    save_split("train", train_graphs)
+    save_split("val", val_graphs)
+    save_split("test", test_graphs)
+
+    summary = {
+        "num_graphs": num_graphs,
+        "split_sizes": {
+            "train": len(train_graphs),
+            "val": len(val_graphs),
+            "test": len(test_graphs),
+        },
+        "label_distribution": {
+            "train": label_stats(train_graphs),
+            "val": label_stats(val_graphs),
+            "test": label_stats(test_graphs),
+        },
+        "config": {
+            "window_size": config.window_size,
+            "stride": config.stride,
+            "train_ratio": config.train_ratio,
+            "val_ratio": config.val_ratio,
+            "min_rows_per_window": config.min_rows_per_window,
+            "min_nodes": config.min_nodes,
+            "min_graphs_per_split": config.min_graphs_per_split,
+        },
+    }
+    with open(dataset_dir / "summary.json", "w", encoding="utf-8") as fp:
+        json.dump(summary, fp, indent=2, ensure_ascii=False)
+
+    print("Preprocessing complete:")
+    print(json.dumps(summary, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
     config = parse_args()
-    telemetry_df = _load_telemetry(config)
-    network_df = _load_network(config)
-    (
-        graphs,
-        metadata,
-        split,
-        diagnostics,
-        applied_config,
-        attempts,
-    ) = _generate_graphs_with_split(telemetry_df, network_df, config)
-    diagnostics.setdefault("applied_window", {})
-    diagnostics["applied_window"].update(
-        {
-            "window_size": applied_config.window_size,
-            "stride": applied_config.stride,
-            "min_nodes": applied_config.min_nodes,
-            "min_split_graphs": applied_config.min_split_graphs,
-        }
-    )
-    if attempts:
-        diagnostics.setdefault("window_search_attempts", attempts)
-    dataset_root = config.output_root / "toni_iot"
-    _save_split(split, metadata, dataset_root, diagnostics)
-    print(f"Saved TON_IoT graphs to {dataset_root / 'processed'}")
+    run_preprocessing(config)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - CLI entry
     main()
-

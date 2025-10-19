@@ -41,17 +41,17 @@
 ## 2. TON_IoT 数据集
 
 1. **下载与解析**
-   - 从 [UNSW 官网](https://research.unsw.edu.au/projects/toniot-datasets) 下载以下官方 CSV 压缩包，并解压到同一目录：
-     - `Train_Test_IoT_Telemetry.zip`（IIoT/Telemetry 数据集，内含 `Train_Test_IoT_Telemetry.csv` 等传感器读数）。
-     - `Train_Test_Network.zip`（Network Traffic 数据集，内含 `Train_Test_Network.csv` 等网络流量统计）。
-     - 可选：若需结合系统日志，可额外下载 `Train_Test_Windows.zip`、`Train_Test_Linux.zip` 等日志 CSV，脚本会自动忽略无法识别的字段。
-   - 若暂时只具备 `Train_Test_Network.csv`，可直接将该文件（或重命名后的 `train_test_network.csv`）放到仓库的 `src/data/` 目录；`preprocess_toniot.py` 会自动检测该文件并进入“网络流量特征”回退路径：以 `src`/`dst` 设备 ID 构建节点，统计出入度、端口与字节类数值字段的窗口统计量，并根据网络日志标签推断节点是否受攻。示例命令：
+   - 按 TrustGuard 的目录结构，将 `Train_Test_Network.csv` 放置于 `data/raw/ton_iot/Train_Test_Network.csv`。
+   - 其他日志（Telemetry、Windows、Linux）可选；脚本目前仅基于网络流量 CSV 构建图。
+   - 运行：
 
     ```bash
     python scripts/preprocess_toniot.py \
+      --raw-root data/raw/ton_iot \
       --output-root data \
-      --min-split-graphs 40 \
-      --min-class-per-split 20
+      --window-size 120 \
+      --stride 60 \
+      --min-rows-per-window 32
     ```
    - 统一时间戳并按设备 ID 分组。
 
@@ -68,15 +68,9 @@
 4. **标签与划分**
    - 标签来自提供的攻击标记；
   - 训练/验证：选取 70% 设备；测试：剩余 30% 未见设备；
-  - 当窗口数量极少导致验证/测试集为空或不足以达到 `--min-split-graphs`（默认 30，可按需提高至 40 以上）或
-    `--min-class-per-split`（默认 20）时，脚本会自动缩短窗口、减小步幅并在必要时降低 `--min-nodes`，直至所有划分满足阈值。
-    若所有组合均失败，`diagnostics.window_search_attempts` 会列出尝试过的参数与失败原因（例如 `reason: class_below_min`），
-    此时需继续缩小窗口、降低 `--min-nodes` 或补充数据后重试。
-  - 划分默认使用时间顺序（60%/20%/20%）并记录每个 split 的时间边界，如检测到窗口重叠会在
-    `diagnostics.temporal_overlap` 中提示；为了避免信息泄漏，脚本不会再跨 split 调整窗口补足类别，而是直接抛出错误提示。
-  - 成功生成的数据集会在 `diagnostics.applied_window` 中记录最终窗口、步幅、`min_nodes`、`min_split_graphs` 与
-    `min_class_per_split`，并在 `diagnostics.label_distribution` 中列出各划分的正负样本数量。若原始日志无法覆盖所需类别，
-    脚本会终止并提示需要调整窗口/步幅或补充原始数据，以免后续评估出现 ROC/PR-AUC 未定义等问题。
+  - 当窗口数量极少导致任一划分低于 `--min-graphs-per-split`（默认 30）时，脚本会直接终止并提示调整窗口大小、滑动步长或补充原始数据。
+  - 划分默认使用时间顺序（60%/20%/20%）。当缺乏可解析的时间戳时，退化为按窗口生成顺序切分，与 TrustGuard 在无时间戳子集上的策略一致。
+  - `summary.json` 中会记录 `split_sizes` 与 `label_distribution`，若发现测试集缺少某一类别，需重新设置窗口参数以避免指标失真。
 
 5. **图存储**
    - 采用 `torch.save` 存储预处理后的图；
@@ -98,11 +92,8 @@
 实际运行流程示例：
 
 ```bash
-python scripts/preprocess_veremi.py --raw-root /data/VeReMi_csv --output-root data
-python scripts/preprocess_toniot.py \
-  --output-root data \
-  --min-split-graphs 40 \
-  --min-class-per-split 20  # 默认检测 src/data/train_test_network.csv
+python scripts/preprocess_veremi.py --raw-root data/raw/veremi --output-root data
+python scripts/preprocess_toniot.py --raw-root data/raw/ton_iot --output-root data --window-size 120 --stride 60
 
 # 训练证据图神经网络
 python src/train.py --dataset-root data --dataset-name veremi --epochs 100
