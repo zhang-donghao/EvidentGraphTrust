@@ -17,6 +17,9 @@ from torch_geometric.data import Data
 from tqdm import tqdm
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
 TELEMETRY_COLUMN_ALIASES: Dict[str, Sequence[str]] = {
     "timestamp": ("ts", "timestamp", "time", "date"),
     "device_id": ("device", "device_id", "source_id", "node_id"),
@@ -63,11 +66,12 @@ class TONTConfig:
 
 
 def parse_args() -> TONTConfig:
+    default_raw_root = REPO_ROOT / "src" / "data"
     parser = argparse.ArgumentParser(description="Preprocess TON_IoT dataset")
     parser.add_argument(
         "--raw-root",
         type=Path,
-        default=Path("src/data"),
+        default=default_raw_root,
         help="Directory containing TON_IoT CSV files (defaults to repo src/data)",
     )
     parser.add_argument("--output-root", type=Path, required=True, help="Directory to store processed dataset")
@@ -82,10 +86,26 @@ def parse_args() -> TONTConfig:
         help="Explicit path to Train_Test_Network.csv (defaults to <raw-root>/train_test_network.csv if present)",
     )
     args = parser.parse_args()
-    raw_root = args.raw_root
+    raw_root = args.raw_root.expanduser()
+    if not raw_root.exists() and default_raw_root.exists():
+        warnings.warn(
+            f"Specified raw root {raw_root} does not exist. Falling back to {default_raw_root}.",
+            RuntimeWarning,
+        )
+        raw_root = default_raw_root
     network_file: Optional[Path] = args.network_file
     if network_file is None:
-        candidates = [raw_root / "train_test_network.csv", raw_root / "Train_Test_Network.csv"]
+        candidates = [
+            raw_root / "train_test_network.csv",
+            raw_root / "Train_Test_Network.csv",
+        ]
+        if raw_root != default_raw_root:
+            candidates.extend(
+                [
+                    default_raw_root / "train_test_network.csv",
+                    default_raw_root / "Train_Test_Network.csv",
+                ]
+            )
         for candidate in candidates:
             if candidate.exists():
                 network_file = candidate
@@ -420,8 +440,12 @@ def _extract_graphs_from_network(
     network_df: pd.DataFrame, config: TONTConfig
 ) -> Tuple[List[Data], Dict[str, object]]:
     if network_df.empty:
+        searched_hint = (
+            f"explicit file {config.network_file}" if config.network_file else "default search locations"
+        )
         raise RuntimeError(
-            "Network CSV files were not found. Provide Train_Test_Network.csv or matching files to continue."
+            "Network CSV files were not found. Provide Train_Test_Network.csv or matching files to continue. "
+            f"Checked {searched_hint} within {config.raw_root}."
         )
     numeric_columns = _infer_numeric_columns(network_df)
     graphs: List[Data] = []
