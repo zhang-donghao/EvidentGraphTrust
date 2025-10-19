@@ -72,13 +72,40 @@ def _synthesise_holdout(
     combined.extend(val_ds.to_list())
     combined.extend(test_ds.to_list())
     total = len(combined)
-    if total < 3:
+    if total == 0:
         warnings.warn(
-            "Not enough graphs to create validation/test splits (need at least 3). "
+            "No graphs were available to construct validation/test splits. "
             "Consider rerunning preprocessing with a smaller window or stride to generate more samples.",
             RuntimeWarning,
         )
         return train_ds, val_ds, test_ds
+
+    if total < 3:
+        # For extremely small corpora we duplicate the available graphs so the
+        # trainer can still report metrics. Each clone is detached to avoid
+        # sharing storage between the splits.
+        base_graphs = [graph.clone() for graph in combined]
+        if total == 1:
+            train_graphs = [base_graphs[0].clone()]
+            val_graphs = [base_graphs[0].clone()]
+            test_graphs = [base_graphs[0].clone()]
+        else:  # total == 2
+            train_graphs = [base_graphs[0].clone()]
+            val_graphs = [base_graphs[1].clone()]
+            test_graphs = [base_graphs[0].clone()]
+        warnings.warn(
+            "Validation/test splits were empty; duplicating graphs to create hold-out partitions."
+            " For stable metrics rerun preprocessing to increase the number of windows.",
+            RuntimeWarning,
+        )
+        metadata = dict(getattr(train_ds, "metadata", {}))
+        num_node_features = train_ds.num_node_features
+        num_classes = train_ds.num_classes
+        return (
+            GraphListDataset(train_graphs, num_node_features, num_classes, metadata),
+            GraphListDataset(val_graphs, num_node_features, num_classes, metadata),
+            GraphListDataset(test_graphs, num_node_features, num_classes, metadata),
+        )
 
     generator = torch.Generator().manual_seed(42)
     permutation = torch.randperm(total, generator=generator).tolist()
