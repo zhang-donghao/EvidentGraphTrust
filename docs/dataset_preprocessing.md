@@ -43,6 +43,7 @@
      - `Train_Test_IoT_Telemetry.zip`（IIoT/Telemetry 数据集，内含 `Train_Test_IoT_Telemetry.csv` 等传感器读数）。
      - `Train_Test_Network.zip`（Network Traffic 数据集，内含 `Train_Test_Network.csv` 等网络流量统计）。
      - 可选：若需结合系统日志，可额外下载 `Train_Test_Windows.zip`、`Train_Test_Linux.zip` 等日志 CSV，脚本会自动忽略无法识别的字段。
+   - 若暂时只具备 `Train_Test_Network.csv`，`preprocess_toniot.py` 会进入“网络流量特征”回退路径：以 `src`/`dst` 设备 ID 构建节点，统计出入度、端口与字节类数值字段的窗口统计量，并根据网络日志标签推断节点是否受攻（示例命令：`python scripts/preprocess_toniot.py --raw-root src/data --output-root data`）。
    - 统一时间戳并按设备 ID 分组。
 
 2. **节点与边**

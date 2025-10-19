@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -26,6 +27,8 @@ NETWORK_COLUMN_ALIASES: Dict[str, Sequence[str]] = {
     "src": ("src_device", "src_ip", "source_id", "src"),
     "dst": ("dst_device", "dst_ip", "destination_id", "dst"),
     "protocol": ("protocol", "proto"),
+    "timestamp": ("ts", "timestamp", "time", "date", "datetime"),
+    "label": ("label", "attack", "target", "is_anomaly", "class"),
 }
 
 EXCLUDED_TELEMETRY_COLUMNS = {
@@ -37,6 +40,14 @@ EXCLUDED_TELEMETRY_COLUMNS = {
     "target",
     "is_anomaly",
     "category",
+}
+
+EXCLUDED_NETWORK_FEATURE_COLUMNS = {
+    "src",
+    "dst",
+    "protocol",
+    "timestamp",
+    "label",
 }
 
 
@@ -80,6 +91,26 @@ def _select_column(df: pd.DataFrame, aliases: Sequence[str], required: bool, def
     return ""
 
 
+def _compute_stats(values: np.ndarray) -> Tuple[float, float, float]:
+    if values.size == 0:
+        return 0.0, 0.0, 0.0
+    return float(values.mean()), float(values.std(ddof=0)), float(values.max())
+
+
+def _reduce_label_series(series: pd.Series, normal_tokens: Optional[Sequence[str]] = None) -> int:
+    values = series.dropna()
+    if values.empty:
+        return 0
+    if values.dtype == object:
+        normal = {"normal", "benign", "0", "false", "no"}
+        if normal_tokens is not None:
+            normal = set(normal_tokens)
+        lower = values.astype(str).str.lower()
+        return int(any(token not in normal for token in lower))
+    numeric = pd.to_numeric(values, errors="coerce").fillna(0)
+    return int((numeric > 0).any())
+
+
 def _load_csvs(root: Path, pattern: str) -> List[pd.DataFrame]:
     files = sorted(root.glob(pattern))
     frames = []
@@ -91,12 +122,16 @@ def _load_csvs(root: Path, pattern: str) -> List[pd.DataFrame]:
     return frames
 
 
-def _load_telemetry(config: TONTConfig) -> pd.DataFrame:
+def _load_telemetry(config: TONTConfig) -> Optional[pd.DataFrame]:
     telemetry_frames = _load_csvs(config.raw_root, "**/*Telemetry*.csv")
     if not telemetry_frames:
         telemetry_frames = _load_csvs(config.raw_root, "**/*telemetry*.csv")
     if not telemetry_frames:
-        raise FileNotFoundError(f"No telemetry CSV files found under {config.raw_root}")
+        warnings.warn(
+            "No telemetry CSV files were found. Falling back to network-only preprocessing.",
+            RuntimeWarning,
+        )
+        return None
     df = pd.concat(telemetry_frames, ignore_index=True)
 
     col_map = {
@@ -120,27 +155,61 @@ def _load_network(config: TONTConfig) -> pd.DataFrame:
     if not network_frames:
         return pd.DataFrame(columns=["src", "dst", "protocol"])
     df = pd.concat(network_frames, ignore_index=True)
-    col_map = {}
+    col_map: Dict[str, str] = {}
     for key, aliases in NETWORK_COLUMN_ALIASES.items():
-        col_map[key] = _select_column(df, aliases, required=(key in {"src", "dst"}))
-    df = df.rename(columns={col_map[k]: k for k in col_map if col_map[k]})
-    df = df[[col for col in ("src", "dst", "protocol") if col in df.columns]]
+        required = key in {"src", "dst"}
+        try:
+            col_map[key] = _select_column(df, aliases, required=required)
+        except KeyError:
+            if required:
+                raise
+            col_map[key] = ""
+    rename_map = {col_map[k]: k for k in col_map if col_map[k]}
+    df = df.rename(columns=rename_map)
     for col in ("src", "dst"):
         if col in df.columns:
             df[col] = df[col].astype(str)
+    if "timestamp" in df.columns:
+        if not np.issubdtype(df["timestamp"].dtype, np.number):
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce").astype("Int64") / 1e9
+        df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+    else:
+        df["timestamp"] = np.nan
+    if "label" in df.columns:
+        df["label"] = df["label"].astype(str)
+    if "protocol" in df.columns:
+        df["protocol"] = df["protocol"].astype(str)
+
+    for column in df.columns:
+        if column in EXCLUDED_NETWORK_FEATURE_COLUMNS:
+            continue
+        df[column] = pd.to_numeric(df[column], errors="coerce")
     return df
 
 
 def _window_iterator(df: pd.DataFrame, window: float, stride: float) -> Iterable[pd.DataFrame]:
-    start = df["timestamp"].min()
-    end = df["timestamp"].max()
+    if "timestamp" not in df.columns:
+        yield df
+        return
+    timestamp_series = pd.to_numeric(df["timestamp"], errors="coerce")
+    valid = timestamp_series.dropna()
+    if valid.empty:
+        yield df
+        return
+    start = float(valid.min())
+    end = float(valid.max())
+    if not np.isfinite(start) or not np.isfinite(end) or end - start < window:
+        yield df
+        return
     current = start
-    while current + window <= end:
-        mask = (df["timestamp"] >= current) & (df["timestamp"] < current + window)
+    while current <= end:
+        mask = (timestamp_series >= current) & (timestamp_series < current + window)
         chunk = df.loc[mask]
         if not chunk.empty:
             yield chunk
         current += stride
+        if stride <= 0:
+            break
 
 
 def _build_edges(network_df: pd.DataFrame, devices: List[str]) -> Tuple[np.ndarray, np.ndarray]:
@@ -179,10 +248,8 @@ def _aggregate_features(chunk: pd.DataFrame) -> Tuple[np.ndarray, List[str], Lis
         stats = []
         for metric in metrics:
             values = group[metric].dropna().to_numpy()
-            if values.size == 0:
-                stats.extend([0.0, 0.0, 0.0])
-            else:
-                stats.extend([values.mean(), values.std(ddof=0), values.max()])
+            mean, std, max_val = _compute_stats(values)
+            stats.extend([mean, std, max_val])
         stats.append(float(len(group)))
         feature_list.append(np.array(stats, dtype=np.float32))
     if not feature_list:
@@ -207,20 +274,147 @@ def _aggregate_labels(chunk: pd.DataFrame) -> Dict[str, int]:
     normal_tokens = {"normal", "benign", "0", "false", "no"}
     labels: Dict[str, int] = {}
     for device, series in grouped:
-        values = series.dropna()
-        label = 0
-        if not values.empty:
-            if values.dtype == object:
-                lower = values.astype(str).str.lower()
-                label = int(any(token not in normal_tokens for token in lower))
-            else:
-                numeric = pd.to_numeric(values, errors="coerce").fillna(0)
-                label = int((numeric > 0).any())
-        labels[str(device)] = label
+        labels[str(device)] = _reduce_label_series(series, normal_tokens)
     return labels
 
 
-def _extract_graphs(telemetry_df: pd.DataFrame, network_df: pd.DataFrame, config: TONTConfig) -> Tuple[List[Data], Dict[str, object]]:
+def _infer_numeric_columns(df: pd.DataFrame) -> List[str]:
+    numeric_cols: List[str] = []
+    for column in df.columns:
+        if column in EXCLUDED_NETWORK_FEATURE_COLUMNS:
+            continue
+        if pd.api.types.is_numeric_dtype(df[column]):
+            numeric_cols.append(column)
+    return numeric_cols
+
+
+def _aggregate_network_features(
+    chunk: pd.DataFrame, numeric_columns: Sequence[str]
+) -> Tuple[np.ndarray, List[str], List[str]]:
+    device_series: List[pd.Series] = []
+    if "src" in chunk.columns:
+        device_series.append(chunk["src"].astype(str))
+    if "dst" in chunk.columns:
+        device_series.append(chunk["dst"].astype(str))
+    if not device_series:
+        return np.empty((0, 0), dtype=np.float32), [], []
+    devices_array = pd.unique(pd.concat(device_series, ignore_index=True).dropna()).astype(str)
+    device_ids: List[str] = devices_array.tolist()
+    feature_list: List[np.ndarray] = []
+    feature_names: List[str] = ["outgoing_count", "incoming_count"]
+    for column in numeric_columns:
+        feature_names.extend(
+            [
+                f"out_{column}_mean",
+                f"out_{column}_std",
+                f"out_{column}_max",
+                f"in_{column}_mean",
+                f"in_{column}_std",
+                f"in_{column}_max",
+            ]
+        )
+    empty_frame = chunk.iloc[0:0]
+    for device_str in device_ids:
+        outgoing = chunk[chunk["src"] == device_str] if "src" in chunk.columns else empty_frame
+        incoming = chunk[chunk["dst"] == device_str] if "dst" in chunk.columns else empty_frame
+        stats: List[float] = [float(len(outgoing)), float(len(incoming))]
+        for column in numeric_columns:
+            out_values = outgoing[column].dropna().to_numpy() if column in outgoing.columns else np.array([])
+            in_values = incoming[column].dropna().to_numpy() if column in incoming.columns else np.array([])
+            stats.extend(_compute_stats(out_values))
+            stats.extend(_compute_stats(in_values))
+        feature_list.append(np.array(stats, dtype=np.float32))
+    if not feature_list:
+        return np.empty((0, 0), dtype=np.float32), [], []
+    return np.stack(feature_list), device_ids, feature_names
+
+
+def _aggregate_network_labels(chunk: pd.DataFrame) -> Dict[str, int]:
+    label_col = None
+    for candidate in ("label", "attack", "target", "is_anomaly", "class"):
+        if candidate in chunk.columns:
+            label_col = candidate
+            break
+    device_series: List[pd.Series] = []
+    if "src" in chunk.columns:
+        device_series.append(chunk["src"].astype(str))
+    if "dst" in chunk.columns:
+        device_series.append(chunk["dst"].astype(str))
+    devices: List[str] = []
+    if device_series:
+        devices = pd.unique(pd.concat(device_series, ignore_index=True).dropna()).astype(str).tolist()
+    labels: Dict[str, int] = {device: 0 for device in devices}
+    if label_col is None:
+        return labels
+    for role in ("src", "dst"):
+        if role not in chunk.columns:
+            continue
+        grouped = chunk.groupby(role)[label_col]
+        for device, series in grouped:
+            device_str = str(device)
+            labels[device_str] = max(labels.get(device_str, 0), _reduce_label_series(series))
+    return labels
+
+
+def _extract_graphs_from_network(
+    network_df: pd.DataFrame, config: TONTConfig
+) -> Tuple[List[Data], Dict[str, object]]:
+    if network_df.empty:
+        raise RuntimeError(
+            "Network CSV files were not found. Provide Train_Test_Network.csv or matching files to continue."
+        )
+    numeric_columns = _infer_numeric_columns(network_df)
+    graphs: List[Data] = []
+    feature_cache: List[np.ndarray] = []
+    metadata_feature_names: Optional[List[str]] = None
+    for chunk in tqdm(list(_window_iterator(network_df, config.window_size, config.stride)), desc="Processing windows"):
+        features, device_ids, feature_names = _aggregate_network_features(chunk, numeric_columns)
+        if features.size == 0 or len(device_ids) < config.min_nodes:
+            continue
+        labels_map = _aggregate_network_labels(chunk)
+        labels = torch.tensor([labels_map.get(device, 0) for device in device_ids], dtype=torch.long)
+        window_network = chunk if not chunk.empty else network_df
+        edge_index, edge_weight = _build_edges(window_network, list(device_ids))
+        data = Data(
+            x=torch.from_numpy(features.astype(np.float32)),
+            edge_index=torch.from_numpy(edge_index),
+            edge_weight=torch.from_numpy(edge_weight),
+            y=labels,
+        )
+        data.device_ids = list(device_ids)
+        if "timestamp" in chunk.columns and not chunk["timestamp"].dropna().empty:
+            data.window_start = float(np.nanmin(chunk["timestamp"].to_numpy()))
+            data.window_end = float(np.nanmax(chunk["timestamp"].to_numpy()))
+        graphs.append(data)
+        feature_cache.append(features)
+        if metadata_feature_names is None:
+            metadata_feature_names = feature_names
+
+    if not graphs:
+        raise RuntimeError(
+            "Network-only preprocessing did not yield any graphs. Check that the CSV contains src/dst columns and adjust"
+            " window parameters."
+        )
+
+    scaler = StandardScaler().fit(np.vstack(feature_cache))
+    for data in graphs:
+        data.x = torch.from_numpy(scaler.transform(data.x.numpy()).astype(np.float32))
+
+    metadata = {
+        "feature_names": metadata_feature_names or [],
+        "num_features": int(graphs[0].x.size(-1)),
+        "num_classes": 2,
+        "window_size": config.window_size,
+        "stride": config.stride,
+        "scaler": {"mean": scaler.mean_.tolist(), "scale": scaler.scale_.tolist()},
+        "source_modalities": ["network"],
+    }
+    return graphs, metadata
+
+
+def _extract_graphs_from_telemetry(
+    telemetry_df: pd.DataFrame, network_df: pd.DataFrame, config: TONTConfig
+) -> Tuple[List[Data], Dict[str, object]]:
     graphs: List[Data] = []
     feature_cache: List[np.ndarray] = []
     metadata_feature_names: Optional[List[str]] = None
@@ -261,6 +455,7 @@ def _extract_graphs(telemetry_df: pd.DataFrame, network_df: pd.DataFrame, config
         "window_size": config.window_size,
         "stride": config.stride,
         "scaler": {"mean": scaler.mean_.tolist(), "scale": scaler.scale_.tolist()},
+        "source_modalities": ["telemetry"] + (["network"] if not network_df.empty else []),
     }
     return graphs, metadata
 
@@ -312,7 +507,10 @@ def main() -> None:
     config = parse_args()
     telemetry_df = _load_telemetry(config)
     network_df = _load_network(config)
-    graphs, metadata = _extract_graphs(telemetry_df, network_df, config)
+    if telemetry_df is None:
+        graphs, metadata = _extract_graphs_from_network(network_df, config)
+    else:
+        graphs, metadata = _extract_graphs_from_telemetry(telemetry_df, network_df, config)
     split = _split_graphs(graphs, config.seed)
     dataset_root = config.output_root / "toni_iot"
     _save_split(split, metadata, dataset_root)
