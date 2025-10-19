@@ -76,5 +76,18 @@ def load_dataset(config: DataModuleConfig) -> GraphTrustDataset:
 
     dataset_root = Path(config.dataset_root)
     if not dataset_root.exists():
-        raise FileNotFoundError(f"Dataset root {dataset_root} does not exist. Please run preprocessing first.")
-    return GraphTrustDataset(dataset_root / config.dataset_name, split=config.split)
+        raise FileNotFoundError(
+            f"Dataset root {dataset_root} does not exist. Please run preprocessing first."
+        )
+
+    dataset_dir = dataset_root / config.dataset_name
+    processed_dir = dataset_dir / "processed"
+    expected_file = processed_dir / f"{config.split}_graph.pt"
+    if not expected_file.exists():
+        raise FileNotFoundError(
+            "Processed graph tensors were not found. "
+            f"Expected {expected_file}. Run the preprocessing script for {config.dataset_name} "
+            f"(e.g., scripts/preprocess_toniot.py --output-root {dataset_root}) before training."
+        )
+
+    return GraphTrustDataset(dataset_dir, split=config.split)

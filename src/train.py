@@ -2,12 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Tuple
 
 import torch
 from torch import nn, optim
 from torch_geometric.loader import DataLoader
+
+if __package__ is None or __package__ == "":  # Allow ``python src/train.py``.
+    repo_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(repo_root))
 
 from src.data.datamodules import DataModuleConfig, load_dataset
 from src.models.egtn import EGTNConfig, EvidentialGraphTrustNetwork
