@@ -27,7 +27,10 @@ class GraphTrustDataset(InMemoryDataset):
         self.split = split
         self.metadata: Dict[str, Any] = {}
         super().__init__(root, transform=None, pre_transform=None)
-        loaded = torch.load(self.processed_paths[0])
+        try:
+            loaded = torch.load(self.processed_paths[0], weights_only=False)
+        except TypeError:
+            loaded = torch.load(self.processed_paths[0])
         if isinstance(loaded, dict) and "data_list" in loaded:
             data_list = loaded["data_list"]
             self.metadata = loaded.get("metadata", {})
