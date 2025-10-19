@@ -57,15 +57,21 @@ class GraphTrustDataset(InMemoryDataset):
         self.num_classes = num_classes
 
     @property
-    def raw_file_names(self) -> str:
-        return f"{self.split}.pt"
+    def raw_file_names(self) -> list[str]:
+        # Raw files are handled entirely by the preprocessing scripts, so the
+        # runtime dataset loader does not expect any artefacts in ``raw``.
+        return []
 
     @property
     def processed_file_names(self) -> str:
         return f"{self.split}_graph.pt"
 
     def download(self) -> None:
-        raise RuntimeError("Dataset download is handled externally via scripts/download_data.sh")
+        # All assets are produced offline via the preprocessing CLI, therefore
+        # there is nothing to download at training time. The call is kept as a
+        # no-op so that PyG's dataset initialisation succeeds once the
+        # processed tensors exist.
+        return None
 
     def process(self) -> None:
         raise RuntimeError("Preprocessing should be executed via dedicated scripts before instantiation.")
