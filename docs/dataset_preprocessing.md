@@ -8,27 +8,33 @@
    - 从 [VeReMi 官网](https://veremi-dataset.github.io/) 下载 `scenarioX` 数据包。
    - 使用官方提供的 `logs_to_csv.py` 将 OMNeT++ 日志转换为 CSV。
 
-2. **时间窗口划分**
+2. **预处理脚本**
+   - 运行 `python scripts/preprocess_veremi.py --raw-root <转换后CSV目录> --output-root data`。
+   - 默认会使用 1s 时间窗口、0.5s 滑动步长，将图数据保存到 `data/veremi/processed/train_graph.pt` 等文件。
+   - 可通过参数 `--window-size`、`--stride`、`--distance-threshold` 等调整窗口与边构建策略。
+
+3. **时间窗口划分**
    - 选择窗口长度 `Δt = 1s`，滑动步长 `0.5s`。
    - 对每个窗口统计参与通信的车辆集合，形成子图。
 
-3. **节点特征**
+4. **节点特征**
    - 连续特征：速度、加速度、航向角、位置 (x, y)、历史误差（预测与广播位置差）。
    - 推理特征：上一窗口的信任评分、消息接收次数。
    - 标准化：对连续特征使用 `StandardScaler`，对缺失值采用前向填充。
 
-4. **边特征**
+5. **边特征**
    - 相对距离、相对速度、是否有直接通信。
    - 采用 RBF kernel 将距离映射为权重，用于 GAT/GraphSAGE。
 
-5. **标签定义**
+6. **标签定义**
    - 正类：存在欺骗/伪装攻击的车辆。
    - 负类：正常车辆。
    - 保持攻击类型在各划分中分布一致。
 
-6. **图打包**
+7. **图打包**
    - 使用 PyTorch Geometric 的 `Data`/`HeteroData` 存储节点特征、边索引、边特征、标签。
    - 将多个窗口堆叠为 `InMemoryDataset`，保存为 `.pt` 文件。
+   - 预处理脚本会同时生成 `summary.json` 统计各划分图数量、节点规模与攻击比率。
 
 ## 2. TON_IoT 数据集
 
@@ -54,6 +60,7 @@
 5. **图存储**
    - 采用 `torch.save` 存储预处理后的图；
    - 提供索引文件，记录每个时间窗口、设备映射。
+   - 运行 `python scripts/preprocess_toniot.py --raw-root <TON_IoT目录> --output-root data` 自动完成上述流程。
 
 ## 3. 数据增强与平衡
 
@@ -66,6 +73,17 @@
 - `src/data/datamodules.py`：实现 `prepare_data()` 与 `setup(stage)` 方法；
 - `scripts/download_data.sh`：提供自动下载与解压脚本；
 - `configs/data/veremi.yaml`、`configs/data/toni.yaml`：存储特征选择、窗口大小等参数。
+
+实际运行流程示例：
+
+```bash
+python scripts/preprocess_veremi.py --raw-root /data/VeReMi_csv --output-root data
+python scripts/preprocess_toniot.py --raw-root /data/TON_IoT --output-root data
+
+# 训练证据图神经网络
+python src/train.py --dataset-root data --dataset-name veremi --epochs 100
+python src/train.py --dataset-root data --dataset-name toni_iot --epochs 100
+```
 
 ## 5. 数据质量检查
 

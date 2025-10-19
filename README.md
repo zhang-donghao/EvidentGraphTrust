@@ -61,6 +61,20 @@ EGT 基于 Evidential GNN 框架，结合可信度与不确定性建模，输出
    - 构图策略：根据通信关系、空间邻近性或时间共现建立边。
    - 特征工程：标准化数值特征，编码类别属性，构建历史信誉特征。
 
+> **快速开始**：预处理脚本已经将上述流程脚本化。
+> ```bash
+> # 1. 处理 VeReMi 车联网数据
+> python scripts/preprocess_veremi.py --raw-root /path/to/VeReMi_csv --output-root data
+>
+> # 2. 处理 TON_IoT 物联网数据
+> python scripts/preprocess_toniot.py --raw-root /path/to/TON_IoT --output-root data
+>
+> # 3. 训练证据图网络（示例）
+> python src/train.py --dataset-root data --dataset-name veremi --epochs 100
+> python src/train.py --dataset-root data --dataset-name toni_iot --epochs 100
+> ```
+> 每个脚本会在 `data/<dataset>/processed/` 目录下生成 `train/val/test` 图张量以及 `summary.json`，供后续训练与评估直接使用。
+
 2. **建模与训练**
    - 使用 PyTorch Geometric 构建模型，支持多 GPU/多进程训练。
    - 超参数搜索：学习率、证据正则强度、dropout、图层数。
