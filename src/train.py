@@ -58,7 +58,8 @@ def train_epoch(model: EvidentialGraphTrustNetwork, loader: DataLoader, optimize
         loss.backward()
         optimizer.step()
         total_loss += loss.item() * batch.num_nodes
-    return total_loss / len(loader.dataset)
+    dataset_size = len(loader.dataset)
+    return total_loss / dataset_size if dataset_size > 0 else 0.0
 
 
 def evaluate(model: EvidentialGraphTrustNetwork, loader: DataLoader, device: torch.device) -> dict:
@@ -66,6 +67,9 @@ def evaluate(model: EvidentialGraphTrustNetwork, loader: DataLoader, device: tor
     criterion = nn.CrossEntropyLoss()
     total_loss = 0.0
     metrics = []
+    dataset_size = len(loader.dataset)
+    if dataset_size == 0:
+        return {"loss": float("nan")}
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
@@ -76,7 +80,7 @@ def evaluate(model: EvidentialGraphTrustNetwork, loader: DataLoader, device: tor
             total_loss += loss.item() * batch.num_nodes
             metrics.append(trust_evaluation(outputs["alpha"], batch.y))
     mean_metrics = {k: torch.stack([m[k] for m in metrics]).mean().item() for k in metrics[0]} if metrics else {}
-    mean_metrics["loss"] = total_loss / len(loader.dataset)
+    mean_metrics["loss"] = total_loss / dataset_size
     return mean_metrics
 
 
