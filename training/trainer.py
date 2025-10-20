@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -37,13 +37,28 @@ class TrainingConfig:
 
 
 @dataclass
+class TrunkConfig:
+    target: str = ""
+    kwargs: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class DataConfig:
+    builder: str = ""
+    root: str = "data"
+    kwargs: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class Config:
     model: str = "trustguard"
     head: str = "mlp"
     n_classes: int = 2
     embedding_dim: int = 64
-    evidential: EvidentialConfig = EvidentialConfig()
-    training: TrainingConfig = TrainingConfig()
+    trunk: TrunkConfig = field(default_factory=TrunkConfig)
+    data: DataConfig = field(default_factory=DataConfig)
+    evidential: EvidentialConfig = field(default_factory=EvidentialConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
     log_dir: str = "runs/default"
 
 
@@ -68,7 +83,19 @@ class Trainer:
     def _write_metrics(self, epoch: int, split: str, metrics: Dict[str, Any]) -> None:
         csv_path = Path(self.cfg.log_dir) / "metrics.csv"
         file_exists = csv_path.exists()
-        columns = ["MCC", "AUC", "BA", "F1", "NLL", "ECE", "uncertainty_mean", "loss"]
+        columns = [
+            "MCC",
+            "AUC",
+            "BA",
+            "F1",
+            "NLL",
+            "ECE",
+            "uncertainty_mean",
+            "loss",
+            "L_ece",
+            "L_disson",
+            "L_falseconf",
+        ]
         with csv_path.open("a", newline="") as f:
             writer = csv.writer(f)
             if not file_exists:
@@ -83,17 +110,19 @@ class Trainer:
         head: nn.Module,
         loader: Iterable,
         optimizer: torch.optim.Optimizer,
-    ) -> float:
+    ) -> Dict[str, float]:
         trunk.train()
         head.train()
         total_loss = 0.0
+        aux_metrics: Dict[str, List[float]] = {}
+        num_batches = 0
         for batch in loader:
-            batch = batch.to(self.device)
+            batch = self._prepare_batch(batch)
             h = trunk(batch)
-            u, v = batch.edge_index
+            u, v = self._edge_index(batch)
             h_u = h[u]
             h_v = h[v]
-            y = batch.edge_attr.long().view(-1)
+            y = self._edge_labels(batch)
 
             optimizer.zero_grad()
             if self.cfg.head == "evidential":
@@ -106,6 +135,14 @@ class Trainer:
                     lambda_falseconf=self.cfg.evidential.lambda_falseconf,
                 )
                 loss = loss_dict["loss"]
+                for key, value in loss_dict.items():
+                    if key == "loss":
+                        continue
+                    if isinstance(value, torch.Tensor):
+                        metric_value = float(value.detach().item())
+                    else:
+                        metric_value = float(value)
+                    aux_metrics.setdefault(key, []).append(metric_value)
             else:
                 logits = head(h_u, h_v)
                 loss = F.cross_entropy(logits, y)
@@ -113,20 +150,30 @@ class Trainer:
             loss.backward()
             optimizer.step()
             total_loss += float(loss.item())
-        return total_loss / max(1, len(loader))
+            num_batches += 1
+
+        mean_loss = total_loss / max(1, num_batches)
+        metrics = {"loss": mean_loss}
+        for key, values in aux_metrics.items():
+            if values:
+                metrics[key] = sum(values) / len(values)
+        return metrics
 
     @torch.no_grad()
     def evaluate(self, trunk: nn.Module, head: nn.Module, loader: Iterable):
+        if loader is None:
+            return {}
+
         trunk.eval()
         head.eval()
         meter: Dict[str, Any] = {}
         for batch in loader:
-            batch = batch.to(self.device)
+            batch = self._prepare_batch(batch)
             h = trunk(batch)
-            u, v = batch.edge_index
+            u, v = self._edge_index(batch)
             h_u = h[u]
             h_v = h[v]
-            y = batch.edge_attr.long().view(-1)
+            y = self._edge_labels(batch)
 
             if self.cfg.head == "evidential":
                 out = head(h_u, h_v, aux_alphas=None)
@@ -150,6 +197,35 @@ class Trainer:
                 meter["uncertainty_mean"]
             )
         return metrics
+
+    def _prepare_batch(self, batch: Any):
+        if isinstance(batch, (list, tuple)):
+            if not batch:
+                raise ValueError("Empty batch encountered during training")
+            batch = batch[0]
+        return batch.to(self.device)
+
+    @staticmethod
+    def _edge_index(batch) -> Tuple[torch.Tensor, torch.Tensor]:
+        if hasattr(batch, "edge_label_index"):
+            edge_index = batch.edge_label_index
+        elif hasattr(batch, "edge_index"):
+            edge_index = batch.edge_index
+        else:
+            raise AttributeError("Batch is missing edge indices for supervision")
+        if edge_index.dim() != 2 or edge_index.size(0) != 2:
+            raise ValueError("Edge index must have shape [2, E]")
+        return edge_index[0], edge_index[1]
+
+    @staticmethod
+    def _edge_labels(batch) -> torch.Tensor:
+        if hasattr(batch, "edge_attr") and batch.edge_attr is not None:
+            labels = batch.edge_attr
+        elif hasattr(batch, "edge_label") and batch.edge_label is not None:
+            labels = batch.edge_label
+        else:
+            raise AttributeError("Batch is missing edge labels for supervision")
+        return labels.long().view(-1)
 
 
 class IdentityTrunk(nn.Module):
