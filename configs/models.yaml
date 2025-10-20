@@ -13,10 +13,11 @@ trunk:
     dropout: 0.1
 
 data:
-  builder: your_project.data.iot.build_dataloaders
-  root: data
+  builder: your_pkg.data.build_dataloaders.build_dataloaders
+  root: data/bitcoin_otc
   kwargs:
     dataset_name: bitcoin_otc
+    root: data/bitcoin_otc
     snapshots: 10
     split: standard
     batch_size: 1
