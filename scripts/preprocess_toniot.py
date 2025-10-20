@@ -416,7 +416,18 @@ def _aggregate_window(
 
     label_value = 0
     if labels is not None:
-        label_value = int(any(lbl != "benign" for lbl in labels))
+        benign_tokens = {
+            "benign",
+            "normal",
+            "legitimate",
+            "legit",
+            "0",
+            "false",
+            "non-attack",
+            "non attack",
+            "no attack",
+        }
+        label_value = int(any(lbl not in benign_tokens for lbl in labels))
 
     data = Data()
     data.x = torch.tensor(node_features, dtype=torch.float32)

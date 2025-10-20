@@ -16,6 +16,7 @@ import torch
 from sklearn.metrics import accuracy_score, average_precision_score, f1_score, roc_auc_score
 from torch import nn, optim
 from torch_geometric.loader import DataLoader
+from torch_geometric.nn import global_mean_pool
 
 if __package__ is None or __package__ == "":  # Allow ``python src/train.py``.
     repo_root = Path(__file__).resolve().parents[1]
@@ -121,6 +122,19 @@ def create_model(args: argparse.Namespace, metadata: Dict[str, int]) -> Tuple[nn
     return model, evidential
 
 
+def _pool_graph_outputs(outputs: Dict[str, torch.Tensor], batch: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """Aggregate node-level outputs to graph-level predictions."""
+
+    batch_index = getattr(batch, "batch", None)
+    if batch_index is None:
+        pooled_logits = outputs["logits"].mean(dim=0, keepdim=True)
+        pooled_alpha = outputs["alpha"].mean(dim=0, keepdim=True)
+    else:
+        pooled_logits = global_mean_pool(outputs["logits"], batch_index)
+        pooled_alpha = global_mean_pool(outputs["alpha"], batch_index)
+    return {"logits": pooled_logits, "alpha": pooled_alpha}
+
+
 def train_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -137,10 +151,11 @@ def train_epoch(
         batch = batch.to(device)
         optimizer.zero_grad()
         outputs = model(batch.x, batch.edge_index, getattr(batch, "edge_weight", None))
-        logits = outputs["logits"]
+        pooled = _pool_graph_outputs(outputs, batch)
+        logits = pooled["logits"]
         loss = criterion(logits, batch.y)
         if evidential and not disable_reg:
-            loss += model.regularization_loss(outputs["alpha"])
+            loss += model.regularization_loss(pooled["alpha"])
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
@@ -187,12 +202,13 @@ def evaluate(
         for batch in loader:
             batch = batch.to(device)
             outputs = model(batch.x, batch.edge_index, getattr(batch, "edge_weight", None))
-            logits = outputs["logits"]
+            pooled = _pool_graph_outputs(outputs, batch)
+            logits = pooled["logits"]
             loss = criterion(logits, batch.y)
             if evidential and not disable_reg:
-                loss += model.regularization_loss(outputs["alpha"])
+                loss += model.regularization_loss(pooled["alpha"])
             total_loss += loss.item()
-            pred_bundle = _collect_predictions(outputs, batch.y)
+            pred_bundle = _collect_predictions(pooled, batch.y)
             for key, value in pred_bundle.items():
                 collected[key].append(value.cpu())
 
