@@ -9,6 +9,27 @@ def add_self_loops(adjacency: torch.Tensor) -> torch.Tensor:
     return adjacency + identity
 
 
+def edge_index_to_adjacency(
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    edge_weight: torch.Tensor | None = None,
+    symmetric: bool = True,
+) -> torch.Tensor:
+    """Convert an ``edge_index`` representation to a dense adjacency matrix."""
+
+    device = edge_index.device
+    adjacency = torch.zeros((num_nodes, num_nodes), dtype=torch.float32, device=device)
+    if edge_weight is None:
+        values = torch.ones(edge_index.size(1), device=device)
+    else:
+        values = edge_weight.to(device)
+    adjacency[edge_index[0], edge_index[1]] = values
+    if symmetric:
+        adjacency[edge_index[1], edge_index[0]] = values
+    adjacency.fill_diagonal_(0.0)
+    return adjacency
+
+
 def normalize_adjacency(adjacency: torch.Tensor, add_loops: bool = True) -> torch.Tensor:
     """Symmetrically normalise an adjacency matrix."""
 

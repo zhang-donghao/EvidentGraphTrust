@@ -134,3 +134,32 @@ def train_model(
         trust_scores=trust_scores.cpu(),
         uncertainties=uncertainties.cpu(),
     )
+
+
+def evaluate_probability_predictions(
+    probs: torch.Tensor, labels: torch.Tensor, test_mask: torch.Tensor
+) -> Tuple[Dict[str, float], torch.Tensor, torch.Tensor]:
+    """Evaluate a matrix of probabilities (e.g. TrustGuard outputs)."""
+
+    probs = probs.float()
+    if probs.dim() != 2:
+        raise ValueError("Probability predictions must be a 2D tensor of shape [num_nodes, num_classes].")
+
+    probs = torch.clamp(probs, min=0.0)
+    row_sum = probs.sum(dim=1, keepdim=True)
+    row_sum[row_sum == 0.0] = 1.0
+    probs = probs / row_sum
+
+    predictions = probs.argmax(dim=-1)
+    accuracy = (predictions[test_mask] == labels[test_mask]).float().mean().item()
+    nll = F.nll_loss(probs[test_mask].log(), labels[test_mask]).item()
+    ece = expected_calibration_error(probs[test_mask], labels[test_mask]).item()
+    uncertainties = (-torch.sum(probs * torch.log(probs + 1e-8), dim=-1)).exp()
+
+    metrics = {
+        "test_accuracy": accuracy,
+        "test_nll": nll,
+        "test_ece": ece,
+    }
+
+    return metrics, probs, uncertainties
