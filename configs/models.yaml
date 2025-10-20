@@ -1,0 +1,20 @@
+model: trustguard
+head: evidential
+n_classes: 2
+embedding_dim: 64
+
+evidential:
+  hidden: 128
+  fusion: none
+  lambda_disson: 0.10
+  lambda_falseconf: 0.01
+
+training:
+  lr: 5.0e-3
+  weight_decay: 1.0e-5
+  epochs: 50
+  early_stop: 8
+
+evaluation:
+  protocols: [single_observed, multi_observed, single_unobserved]
+  multi_horizon: 3
