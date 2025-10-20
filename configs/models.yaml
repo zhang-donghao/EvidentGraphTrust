@@ -1,16 +1,27 @@
 model: trustguard
 head: evidential
 n_classes: 2
-embedding_dim: 64
+embedding_dim: 128
 
 trunk:
-  target: ""
-  kwargs: {}
+  target: trustcore.models.trunk.trustguard_trunk.TrustGuardTrunk
+  kwargs:
+    in_dim: 128
+    hidden_dim: 256
+    out_dim: 128
+    num_layers: 3
+    dropout: 0.1
 
 data:
-  builder: ""
+  builder: your_project.data.iot.build_dataloaders
   root: data
-  kwargs: {}
+  kwargs:
+    dataset_name: bitcoin_otc
+    snapshots: 10
+    split: standard
+    batch_size: 1
+    shuffle: false
+    num_workers: 0
 
 evidential:
   hidden: 128
@@ -23,6 +34,7 @@ training:
   weight_decay: 1.0e-5
   epochs: 50
   early_stop: 8
+  seed: 42
 
 evaluation:
   protocols: [single_observed, multi_observed, single_unobserved]

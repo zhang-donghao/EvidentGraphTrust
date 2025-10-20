@@ -34,6 +34,7 @@ class TrainingConfig:
     weight_decay: float = 1e-5
     epochs: int = 50
     early_stop: int = 8
+    seed: int = 7
 
 
 @dataclass
@@ -225,15 +226,15 @@ class Trainer:
             labels = batch.edge_label
         else:
             raise AttributeError("Batch is missing edge labels for supervision")
-        return labels.long().view(-1)
 
-
-class IdentityTrunk(nn.Module):
-    """Simple trunk returning node features as embeddings."""
-
-    def __init__(self, embedding_dim: int) -> None:
-        super().__init__()
-        self.project = nn.Linear(embedding_dim, embedding_dim)
-
-    def forward(self, batch) -> torch.Tensor:  # type: ignore[override]
-        return self.project(batch.x)
+        labels = labels.long().view(-1)
+        edge_count = 0
+        if hasattr(batch, "edge_label_index") and batch.edge_label_index is not None:
+            edge_count = batch.edge_label_index.size(1)
+        elif hasattr(batch, "edge_index") and batch.edge_index is not None:
+            edge_count = batch.edge_index.size(1)
+        if edge_count and labels.numel() != edge_count:
+            raise ValueError(
+                "Edge label tensor size does not match number of supervised edges"
+            )
+        return labels

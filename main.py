@@ -1,55 +1,60 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import random
-import warnings
 from pathlib import Path
 from typing import Any, Dict, Iterable, Tuple
 
 import torch
 import yaml
-from torch import nn
-
-try:
-    from torch_geometric.data import Data
-except ImportError:  # pragma: no cover - allow import failure during docs
-    Data = None  # type: ignore
 
 from training.trainer import (
     Config,
     DataConfig,
     EvidentialConfig,
-    IdentityTrunk,
     Trainer,
     TrainingConfig,
     TrunkConfig,
 )
+from trustcore.utils.checks import assert_nonempty_loader
+from trustcore.utils.resolve import resolve_object
 
 
-def _load_config(path: str) -> dict:
+def _load_config(path: str) -> Dict[str, Any]:
     if not path:
         return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+    with open(path, "r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
 
 
-def _dict_to_config(data: dict) -> Config:
-    evidential = EvidentialConfig(**data.get("evidential", {}))
-    training = TrainingConfig(**data.get("training", {}))
-    trunk_section = data.get("trunk", {}) or {}
+def _deep_update(base: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_update(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def _dict_to_config(data: Dict[str, Any]) -> Config:
+    evidential = EvidentialConfig(**(data.get("evidential") or {}))
+    training = TrainingConfig(**(data.get("training") or {}))
+
+    trunk_section = data.get("trunk") or {}
     trunk = TrunkConfig(
         target=trunk_section.get("target", ""),
-        kwargs=dict(trunk_section.get("kwargs", {}) or {}),
+        kwargs=dict(trunk_section.get("kwargs") or {}),
     )
-    data_section = data.get("data", {}) or {}
+
+    data_section = data.get("data") or {}
     data_cfg = DataConfig(
         builder=data_section.get("builder", ""),
         root=data_section.get("root", "data"),
-        kwargs=dict(data_section.get("kwargs", {}) or {}),
+        kwargs=dict(data_section.get("kwargs") or {}),
     )
-    cfg = Config(
+
+    return Config(
         model=data.get("model", "trustguard"),
         head=data.get("head", "mlp"),
         n_classes=data.get("n_classes", 2),
@@ -60,24 +65,6 @@ def _dict_to_config(data: dict) -> Config:
         training=training,
         log_dir=data.get("log_dir", "runs/default"),
     )
-    return cfg
-
-
-def _synthetic_data(cfg: Config, seed: int = 7) -> Tuple[list, list, list]:
-    if Data is None:
-        raise ImportError("torch_geometric is required for synthetic data generation")
-    random.seed(seed)
-    torch.manual_seed(seed)
-    num_nodes = 16
-    num_edges = 32
-    x = torch.randn(num_nodes, cfg.embedding_dim)
-    edge_index = torch.randint(0, num_nodes, (2, num_edges))
-    edge_attr = torch.randint(0, cfg.n_classes, (num_edges,))
-    data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
-    train = [data]
-    val = [data.clone()]
-    test = [data.clone()]
-    return train, val, test
 
 
 def _parse_json_dict(value: str | None) -> Dict[str, Any]:
@@ -85,71 +72,40 @@ def _parse_json_dict(value: str | None) -> Dict[str, Any]:
         return {}
     try:
         parsed = json.loads(value)
-    except json.JSONDecodeError as exc:  # pragma: no cover - CLI guard
+    except json.JSONDecodeError as exc:  # pragma: no cover - CLI validation
         raise ValueError(f"Invalid JSON dictionary: {value}") from exc
     if not isinstance(parsed, dict):
-        raise ValueError("Parsed value must be a JSON object")
+        raise ValueError("Parsed JSON value must be an object")
     return parsed
 
 
-def _resolve_target(target: str):
-    module_path, _, attr = target.rpartition(".")
-    if not module_path:
-        raise ValueError(f"Invalid target path '{target}'. Expected module.Class format")
-    module = importlib.import_module(module_path)
+def _build_trunk(cfg: Config, device: torch.device) -> torch.nn.Module:
+    if not cfg.trunk.target:
+        raise ValueError("Trunk target must be specified in the configuration")
+    trunk_cls = resolve_object(cfg.trunk.target)
+    trunk = trunk_cls(**cfg.trunk.kwargs)
+    return trunk.to(device)
+
+
+def _invoke_builder(builder, cfg: Config, seed: int, **kwargs):
     try:
-        return getattr(module, attr)
-    except AttributeError as exc:  # pragma: no cover - dynamic import path
-        raise ImportError(f"Target '{attr}' not found in module '{module_path}'") from exc
-
-
-TRUNK_REGISTRY = {
-    "trustguard": "trustguard.model.TrustGuard",
-    "guardian": "trustguard.model.Guardian",
-}
-
-
-def _build_trunk(cfg: Config, device: torch.device) -> nn.Module:
-    target = cfg.trunk.target or TRUNK_REGISTRY.get(cfg.model.lower(), "")
-    if target:
+        return builder(cfg=cfg, seed=seed, **kwargs)
+    except TypeError:
         try:
-            trunk_cls = _resolve_target(target)
-        except (ImportError, ValueError) as exc:
-            if cfg.trunk.target:
-                raise ImportError(
-                    f"Unable to import trunk '{target}'. Provide a valid path via config or --trunk-target"
-                ) from exc
-            warnings.warn(
-                f"Falling back to IdentityTrunk because '{target}' could not be imported: {exc}",
-                RuntimeWarning,
-            )
-        else:
-            trunk = trunk_cls(**cfg.trunk.kwargs)
-            return trunk.to(device)
-    return IdentityTrunk(cfg.embedding_dim).to(device)
+            return builder(seed=seed, **kwargs)
+        except TypeError:
+            return builder(**kwargs)
 
 
 def _build_dataloaders(cfg: Config, seed: int) -> Tuple[Iterable, Iterable | None, Iterable | None]:
-    builder_path = cfg.data.builder
-    if not builder_path:
-        return _synthetic_data(cfg, seed)
+    if not cfg.data.builder:
+        raise ValueError("Data builder must be specified in the configuration")
 
-    data_kwargs = dict(cfg.data.kwargs)
-    data_kwargs.setdefault("root", cfg.data.root)
-    try:
-        builder = _resolve_target(builder_path)
-    except (ImportError, ValueError) as exc:
-        raise ImportError(
-            f"Unable to import data builder '{builder_path}'. Provide a valid path via config or --data-builder"
-        ) from exc
+    builder = resolve_object(cfg.data.builder)
+    kwargs = dict(cfg.data.kwargs)
+    kwargs.setdefault("root", cfg.data.root)
+    loaders = _invoke_builder(builder, cfg, seed, **kwargs)
 
-    try:
-        loaders = builder(cfg=cfg, seed=seed, **data_kwargs)
-    except TypeError:
-        try:
-            loaders = builder(seed=seed, **data_kwargs)
-        except TypeError:
-            loaders = builder(**data_kwargs)
     train_loader: Iterable | None = None
     val_loader: Iterable | None = None
     test_loader: Iterable | None = None
@@ -169,7 +125,14 @@ def _build_dataloaders(cfg: Config, seed: int) -> Tuple[Iterable, Iterable | Non
         train_loader = loaders
 
     if train_loader is None:
-        raise ValueError("Data builder did not return a training loader")
+        raise RuntimeError("Data builder did not return a training loader")
+
+    assert_nonempty_loader(train_loader, "train")
+    if val_loader is not None:
+        assert_nonempty_loader(val_loader, "val")
+    if test_loader is not None:
+        assert_nonempty_loader(test_loader, "test")
+
     return train_loader, val_loader, test_loader
 
 
@@ -180,45 +143,59 @@ def _set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _describe_loader(name: str, loader: Iterable) -> None:
+    iterator = iter(loader)
+    batch = next(iterator)
+
+    num_nodes = getattr(batch, "num_nodes", None)
+    if num_nodes is None and hasattr(batch, "x"):
+        num_nodes = batch.x.size(0)
+
+    edge_index = getattr(batch, "edge_index", None)
+    num_edges = edge_index.size(1) if edge_index is not None else None
+
+    labels = None
+    if hasattr(batch, "edge_attr") and batch.edge_attr is not None:
+        labels = batch.edge_attr
+    elif hasattr(batch, "edge_label") and batch.edge_label is not None:
+        labels = batch.edge_label
+
+    label_shape = tuple(labels.shape) if labels is not None else None
+    print(
+        f"{name}: nodes={num_nodes}, edges={num_edges}, edge_label_shape={label_shape}, "
+        f"label_dtype={getattr(labels, 'dtype', None)}"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Trust modeling trainer entrypoint")
-    parser.add_argument("--config", type=str, default="", help="Path to YAML config")
-    parser.add_argument("--model", type=str, default=None, help="Model trunk to use")
-    parser.add_argument("--head", type=str, default=None, choices=["mlp", "evidential"], help="Head type")
-    parser.add_argument("--dataset", type=str, default="synthetic", help="Dataset name")
-    parser.add_argument("--snapshots", type=int, default=1, help="Number of snapshots")
-    parser.add_argument("--eval_protocol", type=str, default="single_observed", help="Evaluation protocol")
-    parser.add_argument("--log_dir", type=str, default="runs/default", help="Logging directory")
-    parser.add_argument("--seed", type=int, default=7, help="Random seed")
-    parser.add_argument("--trunk-target", type=str, default=None, help="Dotted path to trunk class")
-    parser.add_argument(
-        "--trunk-kwargs",
-        type=str,
-        default=None,
-        help="JSON dict of keyword arguments for trunk initialization",
-    )
-    parser.add_argument(
-        "--data-builder",
-        type=str,
-        default=None,
-        help="Dotted path to data loader builder returning train/val/(test)",
-    )
-    parser.add_argument(
-        "--data-kwargs",
-        type=str,
-        default=None,
-        help="JSON dict forwarded to the data builder",
-    )
-    parser.add_argument("--data-root", type=str, default=None, help="Dataset root directory")
+    parser.add_argument("--config", type=str, default="", help="Path to YAML configuration")
+    parser.add_argument("--model", type=str, default=None, help="Model identifier")
+    parser.add_argument("--head", type=str, choices=["mlp", "evidential"], help="Head type")
+    parser.add_argument("--log_dir", type=str, default=None, help="Logging directory override")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed override")
+    parser.add_argument("--trunk-target", type=str, default=None, help="Override trunk dotted path")
+    parser.add_argument("--trunk-kwargs", type=str, default=None, help="JSON dict for trunk init kwargs")
+    parser.add_argument("--data-builder", type=str, default=None, help="Override data builder dotted path")
+    parser.add_argument("--data-kwargs", type=str, default=None, help="JSON dict forwarded to data builder")
+    parser.add_argument("--data-root", type=str, default=None, help="Dataset root override")
+    parser.add_argument("--override_json", type=str, default=None, help="JSON overrides merged into config")
+    parser.add_argument("--inspect_data", action="store_true", help="Inspect loaders then exit")
     args = parser.parse_args()
 
     cfg_dict = _load_config(args.config)
+    if args.override_json:
+        overrides = _parse_json_dict(args.override_json)
+        _deep_update(cfg_dict, overrides)
+
     cfg = _dict_to_config(cfg_dict)
+
     if args.model:
         cfg.model = args.model
     if args.head:
         cfg.head = args.head
-    cfg.log_dir = args.log_dir or cfg.log_dir
+    if args.log_dir:
+        cfg.log_dir = args.log_dir
     if args.trunk_target:
         cfg.trunk.target = args.trunk_target
     if args.trunk_kwargs:
@@ -230,9 +207,15 @@ def main() -> None:
     if args.data_root:
         cfg.data.root = args.data_root
 
+    seed_value = args.seed if args.seed is not None else cfg.training.seed
+    cfg.training.seed = seed_value
+
+    _set_seed(seed_value)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     trainer = Trainer(cfg, device=device)
-    trunk: nn.Module = _build_trunk(cfg, device)
+
+    trunk = _build_trunk(cfg, device)
     head = trainer._build_head(cfg.embedding_dim, cfg.n_classes)
 
     optimizer = torch.optim.Adam(
@@ -241,8 +224,16 @@ def main() -> None:
         weight_decay=cfg.training.weight_decay,
     )
 
-    _set_seed(args.seed)
-    train_loader, val_loader, test_loader = _build_dataloaders(cfg, seed=args.seed)
+    train_loader, val_loader, test_loader = _build_dataloaders(cfg, seed=seed_value)
+
+    if args.inspect_data:
+        _describe_loader("train", train_loader)
+        if val_loader is not None:
+            _describe_loader("val", val_loader)
+        if test_loader is not None:
+            _describe_loader("test", test_loader)
+        raise SystemExit(0)
+
     for epoch in range(cfg.training.epochs):
         train_metrics = trainer.train_one_epoch(trunk, head, train_loader, optimizer)
         trainer._write_metrics(epoch, "train", train_metrics)
